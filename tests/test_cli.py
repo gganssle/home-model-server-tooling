@@ -1,0 +1,188 @@
+"""Exercise the CLI against a real (stubbed-model) server over HTTP.
+
+This is the SSH path: a client process that never imports mlx, talking to a
+daemon that holds the models.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import free_port  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+HEARTH = ROOT / ".venv" / "bin" / "hearth"
+PYTHON = ROOT / ".venv" / "bin" / "python"
+PORT = str(free_port())
+
+TMP = Path(tempfile.mkdtemp(prefix="hearth-cli-test-"))
+ENV = {
+    **os.environ,
+    "HEARTH_DATA_DIR": str(TMP / "data"),
+    "HEARTH_CONFIG_DIR": str(TMP / "config"),
+    "HEARTH_PORT": PORT,
+    "HEARTH_HOST": "127.0.0.1",
+    "PYTHONPATH": str(ROOT / "tests"),
+    "NO_COLOR": "1",
+}
+
+PASSED, FAILED = [], []
+
+
+def check(name, condition, detail=""):
+    (PASSED if condition else FAILED).append(name)
+    print(f"  {'ok  ' if condition else 'FAIL'} {name}" + (f"  {detail}" if not condition else ""))
+
+
+# Generous: each call is a cold Python start, and the box may be busy.
+def run(*args, stdin=None, timeout=240):
+    # Always pass an explicit `input`: with input=None the child inherits our
+    # stdin, and if that is an open pipe nobody closes, a command that reads
+    # stdin blocks forever.
+    return subprocess.run(
+        [str(HEARTH), *args], env=ENV, capture_output=True, text=True,
+        input=stdin if stdin is not None else "", timeout=timeout,
+    )
+
+
+def main() -> int:
+    if not HEARTH.exists():
+        print(f"missing {HEARTH}; run: uv pip install -e .")
+        return 1
+
+    print("\nserver not running")
+    r = run("status")
+    check("clear error when server is down",
+          r.returncode != 0 and "cannot reach" in (r.stderr + r.stdout).lower(),
+          repr((r.stderr + r.stdout)[:160]))
+
+    print("\nstarting stub server")
+    server = subprocess.Popen(
+        [str(PYTHON), str(ROOT / "tests" / "stub_server.py")],
+        env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        ready = False
+        for _ in range(100):
+            if run("status", timeout=60).returncode == 0:
+                ready = True
+                break
+            if server.poll() is not None:
+                print("server died:", server.stderr.read()[:2000])
+                return 1
+            time.sleep(0.2)
+        check("server reachable", ready)
+        if not ready:
+            return 1
+
+        print("\nstatus")
+        r = run("status")
+        check("status emits json when piped", '"memory"' in r.stdout, r.stdout[:160])
+
+        print("\nask")
+        r = run("ask", "hello there")
+        check("ask returns the answer on stdout",
+              r.stdout.strip() == "you said: hello there", repr(r.stdout[:160]))
+        check("ask keeps stdout clean for pipes",
+              r.stdout.count("\n") == 1, repr(r.stdout))
+
+        print("\nask via stdin")
+        r = run("ask", "summarize", stdin="some piped input")
+        check("stdin is appended to the prompt",
+              "some piped input" in r.stdout, repr(r.stdout[:200]))
+
+        print("\nstdin that never closes")
+        # An inherited pipe with no writer is what launchd/cron/CI hand you. A
+        # blocking read here used to hang the command forever.
+        rfd, wfd = os.pipe()
+        try:
+            t0 = time.time()
+            done = subprocess.run(
+                [str(HEARTH), "ask", "hello there"], env=ENV, stdin=rfd,
+                capture_output=True, text=True, timeout=90,
+            )
+            check("does not hang on an idle stdin", True)
+            check("still answers", "you said: hello there" in done.stdout,
+                  repr(done.stdout[:160]))
+            check("returns promptly", time.time() - t0 < 60, f"{time.time()-t0:.0f}s")
+        except subprocess.TimeoutExpired:
+            check("does not hang on an idle stdin", False, "timed out")
+        finally:
+            os.close(rfd)
+            os.close(wfd)
+
+        print("\nthreads")
+        r = run("threads")
+        lines = [ln for ln in r.stdout.strip().splitlines() if ln]
+        check("threads are listed tab-separated", len(lines) >= 2 and "\t" in lines[0],
+              repr(r.stdout[:200]))
+        first_id = lines[0].split("\t")[0]
+        check("thread ids look right", first_id.startswith("t_"), first_id)
+
+        print("\nthread continuation")
+        r = run("ask", "--thread", first_id, "again")
+        check("continuing a thread works", "again" in r.stdout, repr(r.stdout[:160]))
+        r = run("show", first_id)
+        check("show prints the transcript",
+              "[user]" in r.stdout and "[assistant]" in r.stdout, repr(r.stdout[:200]))
+
+        print("\nprefix + last refs")
+        r = run("show", first_id[:6])
+        check("id prefix resolves", r.returncode == 0 and "[user]" in r.stdout)
+        r = run("show", "last")
+        check("'last' resolves", r.returncode == 0)
+
+        print("\nimage")
+        out = TMP / "out.png"
+        r = run("image", "a red barn", "-o", str(out), "--steps", "3")
+        check("image command succeeds", r.returncode == 0, r.stderr[:300])
+        check("png written to disk", out.exists() and out.read_bytes()[:4] == b"\x89PNG")
+        check("path printed to stdout", str(out) in r.stdout, repr(r.stdout[:200]))
+
+        print("\nsearch")
+        r = run("search", "hello")
+        check("search finds the message", "hello" in r.stdout, repr(r.stdout[:200]))
+
+        print("\nunload")
+        r = run("unload", "all")
+        check("unload runs", r.returncode == 0, r.stderr[:200])
+
+        print("\nconfig")
+        r = run("config", "--path")
+        check("config path printed", "config.toml" in r.stdout, r.stdout[:200])
+        check("config file created", Path(r.stdout.strip()).exists())
+
+        print("\ndelete")
+        r = run("rm", first_id, "-y")
+        check("thread deleted", r.returncode == 0, r.stderr[:200])
+        r = run("show", first_id)
+        check("deleted thread is gone", r.returncode != 0)
+
+        print("\nhelp surfaces every command")
+        r = run("--help")
+        for cmd in ("chat", "ask", "image", "threads", "serve", "pull", "status"):
+            check(f"help lists {cmd}", cmd in r.stdout, r.stdout[:400])
+
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+        shutil.rmtree(TMP, ignore_errors=True)
+
+    print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
+    if FAILED:
+        print("failures:", FAILED)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

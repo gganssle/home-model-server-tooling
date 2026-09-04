@@ -60,18 +60,65 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+uv venv --python 3.12
+uv pip install -e .
+
+./run_tests.sh                          # full suite; stubs the models, no GPU or weights needed
+./.venv/bin/ruff check src/ tests/ --select F,E9
+
+./.venv/bin/python tests/smoke_real.py  # real models; requires `hearth pull` first
 ```
+
+`run_tests.sh` covers the HTTP surface, the CLI (spawned as real subprocesses),
+cancellation and queueing, the REPL under a pty, and the web UI's markdown
+renderer under node.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+One daemon owns the models; the CLI and the web UI are both thin HTTP clients
+over it. That split is deliberate — it is what lets an SSH session start
+instantly instead of loading a 38GB model, and it lets a conversation started
+in the browser be continued from the terminal.
+
+```
+src/hearth/
+  config.py       TOML + HEARTH_* env configuration
+  store.py        SQLite threads and messages
+  textutil.py     incremental <think> block splitting
+  engine/
+    manager.py    job queue, lazy loading, idle eviction
+    text.py       mlx-vlm text generation
+    image.py      mflux image generation
+  server.py       FastAPI: thread API, SSE, OpenAI shim
+  client.py       HTTP client used by the CLI
+  cli.py          commands and the interactive REPL
+  web/index.html  the web UI (single file, no build step)
+```
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+**All GPU work runs on one worker thread** (`engine/manager.py`). MLX is not
+safe to run concurrently and two large models racing for unified memory will
+wedge the machine, so requests queue rather than collide.
+
+**mflux must generate on the thread that loaded it.** MLX streams are
+per-thread; running the denoise loop on a different thread fails with
+"There is no Stream(cpu, N)". This is why image progress is reported through an
+`emit` callback rather than yielded — yielding would require a second thread.
+
+**Qwen's chat template pre-opens `<think>`.** With reasoning on, the prompt ends
+in a bare `<think>` and the model's first token is already inside the block, so
+the only tag ever seen is the closing one. `ThinkSplitter(start_in_think=True)`
+handles this; the engine signals it with a `start` event.
+
+**Request models are strict** (`extra="forbid"`). A misspelled field should 422,
+not be silently ignored — a CLI/server field-name mismatch once made `--think` a
+no-op. The OpenAI shim stays permissive on purpose.
+
+**The CLI must never hang.** When a prompt argument is given, stdin is read only
+if data is already waiting; a blocking read there hangs forever under launchd,
+cron, or any parent that leaks an open stdin.
+
+**Tests bind ephemeral ports** and always pass explicit subprocess stdin. Fixed
+ports and inherited stdin were both sources of real flakiness.
