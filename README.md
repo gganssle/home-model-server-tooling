@@ -105,21 +105,25 @@ git diff | hearth ask "write a commit message"
 
 ### In the REPL
 
+Type `/` at the prompt and the command list opens under it, filtering as you
+keep typing — pick one with the arrow keys or Tab.
+
 ```
-/new [title]        start a new conversation
-/threads            list conversations
-/switch <ref>       jump to another conversation
-/image <prompt>     generate an image in this conversation
-/attach <path>      queue an image for the model to look at
-/detach             drop queued attachments
-/edit <prompt>      redraw the newest image in this conversation
-/think on|off       toggle reasoning mode
-/retry              re-run your last message
-/title <text>       rename this conversation
-/show               reprint the conversation
-/status             what is loaded, memory use
-/unload [what]      free memory
-/quit               exit (Ctrl-D works too)
+/new [title]               start a new conversation
+/threads                   list conversations
+/switch <id|prefix|last>   jump to another conversation
+/image <prompt>            generate an image in this conversation
+/edit <prompt>             redraw the newest image in this conversation
+/attach <path>             queue an image for the model to look at
+/detach                    drop queued attachments
+/think on|off              toggle reasoning mode
+/retry                     re-run your last message
+/title <text>              rename this conversation
+/show                      reprint the conversation so far
+/status                    what is loaded, memory use
+/unload [all|text|image]   free memory
+/help                      this list
+/quit                      exit  (/exit, /q and Ctrl-D also work)
 ```
 
 Ctrl-C stops a running generation without leaving the chat. The partial answer

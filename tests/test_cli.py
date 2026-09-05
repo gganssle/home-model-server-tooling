@@ -209,6 +209,12 @@ def main() -> int:
         for cmd in ("chat", "ask", "image", "threads", "serve", "pull", "status"):
             check(f"help lists {cmd}", cmd in r.stdout, r.stdout[:400])
 
+        r2 = run("chat", "--help")
+        for slash in ("/new", "/switch", "/attach", "/edit", "/think", "/unload", "/quit"):
+            check(f"chat --help documents {slash}", slash in r2.stdout, r2.stdout[:600])
+        check("chat --help keeps the argument hints",
+              "[title]" in r2.stdout, r2.stdout[:600])
+
         print("\nserve announces where images are kept")
         banner_env = {**ENV, "HEARTH_PORT": str(free_port())}
         proc = subprocess.Popen(

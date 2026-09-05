@@ -5,9 +5,12 @@ piping, which is also the closest thing to how the command is actually used.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
 import re
+import struct
+import termios
 import shutil
 import subprocess
 import sys
@@ -48,12 +51,15 @@ def check(name, condition, detail=""):
 class Repl:
     """A `hearth chat` process attached to a pseudo-terminal."""
 
-    def __init__(self):
+    def __init__(self, term: str | None = None):
         self.master, slave = pty.openpty()
+        # Give the pty a real size, or prompt_toolkit has no room to draw the
+        # completion menu.
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
         self.proc = subprocess.Popen(
             [str(HEARTH), "chat"],
             stdin=slave, stdout=slave, stderr=slave,
-            env=ENV, close_fds=True,
+            env={**ENV, "TERM": term} if term else ENV, close_fds=True,
         )
         os.close(slave)
         self.buf = ""
@@ -79,6 +85,10 @@ class Repl:
 
     def send(self, line: str) -> None:
         os.write(self.master, (line + "\n").encode())
+
+    def type(self, text: str) -> None:
+        """Type without pressing return, so the line stays open."""
+        os.write(self.master, text.encode())
 
     def close(self) -> None:
         try:
@@ -126,6 +136,8 @@ def main() -> int:
         check("/help lists commands", repl.read_until("/switch"), repr(repl.buf[-300:]))
         check("/help lists /attach", repl.read_until("/attach"), repr(repl.buf[-400:]))
         check("/help lists /edit", repl.read_until("/edit"), repr(repl.buf[-400:]))
+        check("/help keeps the argument hints", repl.read_until("/new [title]"),
+              repr(repl.buf[-400:]))
 
         repl.buf = ""
         repl.send("/think on")
@@ -213,6 +225,30 @@ def main() -> int:
         repl.send("/nonsense")
         check("unknown command is reported", repl.read_until("unknown command"),
               repr(repl.buf[-200:]))
+
+        print("\ncommand menu")
+        # The menu is drawn by prompt_toolkit, which needs a terminal it can
+        # address - the rest of these tests run under TERM=dumb.
+        menu = Repl(term="xterm-256color")
+        try:
+            menu.read_until("new conversation")
+            menu.buf = ""
+            menu.type("/")
+            check("typing / lists the commands", menu.read_until("/threads", timeout=10),
+                  repr(menu.buf[-400:]))
+            check("the menu describes each command",
+                  menu.read_until("list conversations", timeout=10), repr(menu.buf[-400:]))
+            menu.buf = ""
+            menu.type("th")
+            check("the list narrows as you type",
+                  menu.read_until("toggle reasoning mode", timeout=10), repr(menu.buf[-400:]))
+            menu.buf = ""
+            menu.type("ink ")
+            check("a command's argument words are offered too",
+                  menu.read_until("off", timeout=10), repr(menu.buf[-400:]))
+        finally:
+            menu.type("\x03")   # abandon the half-typed line
+            menu.close()
 
         print("\nexit")
         repl.buf = ""

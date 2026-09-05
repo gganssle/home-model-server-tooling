@@ -12,11 +12,12 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, NamedTuple, Optional
 
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.table import Table
 
 from hearth import config as config_mod
@@ -651,38 +652,114 @@ def main() -> None:
 # interactive REPL
 # --------------------------------------------------------------------------
 
-REPL_HELP = """
-[bold]commands[/bold]
-  /new [title]        start a new conversation
-  /threads            list conversations
-  /switch <ref>       jump to another conversation (id, prefix, or 'last')
-  /image <prompt>     generate an image in this conversation
-  /attach <path>      queue an image for the model to look at
-  /detach             drop queued attachments
-  /edit <prompt>      redraw the newest image in this conversation
-  /think on|off       toggle reasoning mode
-  /retry              re-run your last message
-  /title <text>       rename this conversation
-  /show               reprint the conversation so far
-  /status             what is loaded, memory use
-  /unload [all|text|image]   free memory
-  /help               this list
-  /quit               exit  (Ctrl-D also works)
+# One table drives three things that were previously written out separately,
+# and so drifted: the /help listing, `hearth chat --help`, and the menu that
+# opens when you type "/" at the prompt.
+class Slash(NamedTuple):
+    name: str
+    args: str          # how the arguments are shown in help, e.g. "<prompt>"
+    help: str
+    aliases: tuple[str, ...] = ()
+    choices: tuple[str, ...] = ()   # fixed words, completed after the name
 
-[dim]Ctrl-C stops a running generation without leaving the chat.
-Submit a multi-line message with Esc then Enter.[/dim]
-"""
+    @property
+    def usage(self) -> str:
+        return f"{self.name} {self.args}".strip()
 
 
-@app.command()
+SLASH_COMMANDS = [
+    Slash("/new", "[title]", "start a new conversation"),
+    Slash("/threads", "", "list conversations"),
+    Slash("/switch", "<id|prefix|last>", "jump to another conversation", choices=("last",)),
+    Slash("/image", "<prompt>", "generate an image in this conversation"),
+    Slash("/edit", "<prompt>", "redraw the newest image in this conversation"),
+    Slash("/attach", "<path>", "queue an image for the model to look at"),
+    Slash("/detach", "", "drop queued attachments"),
+    Slash("/think", "on|off", "toggle reasoning mode", choices=("on", "off")),
+    Slash("/retry", "", "re-run your last message"),
+    Slash("/title", "<text>", "rename this conversation"),
+    Slash("/show", "", "reprint the conversation so far"),
+    Slash("/status", "", "what is loaded, memory use"),
+    Slash("/unload", "[all|text|image]", "free memory", choices=("all", "text", "image")),
+    Slash("/help", "", "this list"),
+    Slash("/quit", "", "exit  (/exit, /q and Ctrl-D also work)", aliases=("/exit", "/q")),
+]
+
+
+def _slash_table(indent: str = "  ") -> list[str]:
+    """The command list as aligned plain-text lines."""
+    width = max(len(c.usage) for c in SLASH_COMMANDS)
+    return [f"{indent}{c.usage:<{width}}   {c.help}" for c in SLASH_COMMANDS]
+
+
+# Square brackets are rich's markup syntax, so an unescaped "[title]" is read
+# as a style tag and vanishes from the output. Both consumers below need it
+# escaped - typer renders command help through rich too.
+REPL_HELP = (
+    "\n[bold]commands[/bold]\n"
+    + "\n".join(escape(line) for line in _slash_table())
+    + "\n\n[dim]Type / at the prompt to pick from this list.\n"
+    "Ctrl-C stops a running generation without leaving the chat.\n"
+    "Submit a multi-line message with Esc then Enter.[/dim]\n"
+)
+
+# The lone `\b` line tells click not to re-wrap the paragraph after it.
+CHAT_HELP = (
+    "Interactive chat. This is the one you want over SSH.\n\n\b\n"
+    "Commands, typed at the chat prompt (type / to pick from a menu):\n"
+    + "\n".join(escape(line) for line in _slash_table())
+)
+
+
+def slash_completer():
+    """Complete slash commands, so that typing "/" opens the list of them."""
+    from prompt_toolkit.completion import Completer, Completion
+
+    class SlashCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("/"):
+                return          # an ordinary message: nothing to offer
+            typed, sep, rest = text.partition(" ")
+            typed = typed.lower()
+
+            if not sep:
+                for cmd in SLASH_COMMANDS:
+                    # Aliases are only worth showing once you have typed enough
+                    # to mean one; a bare "/" should list each command once.
+                    names = [cmd.name] if typed == "/" else [cmd.name, *cmd.aliases]
+                    for name in names:
+                        if name.startswith(typed):
+                            yield Completion(
+                                name,
+                                start_position=-len(typed),
+                                display=cmd.usage if name == cmd.name else name,
+                                display_meta=cmd.help,
+                            )
+                return
+
+            # Past the command name: offer the fixed words it accepts, if any.
+            word = rest.strip()
+            if " " in word:
+                return
+            cmd = next((c for c in SLASH_COMMANDS
+                        if typed == c.name or typed in c.aliases), None)
+            for choice in cmd.choices if cmd else ():
+                if choice.startswith(word.lower()):
+                    yield Completion(choice, start_position=-len(word))
+
+    return SlashCompleter()
+
+
+@app.command(help=CHAT_HELP)
 def chat(
     ref: Optional[str] = typer.Argument(None, help="Resume a thread (id, prefix, or 'last')."),
     think: bool = typer.Option(False, "--think", help="Start with reasoning mode on."),
 ) -> None:
-    """Interactive chat. This is the one you want over SSH."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.shortcuts import CompleteStyle
 
     cfg = config_mod.load()
     client = HearthClient(cfg.base_url)
@@ -707,13 +784,19 @@ def chat(
         console.print(f"[dim]new conversation {thread['id']}[/dim]")
 
     console.print(f"[dim]{cfg.text.repo}[/dim]")
-    console.print("[dim]/help for commands, /quit to exit[/dim]\n")
+    console.print("[dim]/ for commands, /quit to exit[/dim]\n")
 
     history_path = config_mod.DATA_DIR / "cli_history"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(
         history=FileHistory(str(history_path)),
         auto_suggest=AutoSuggestFromHistory(),
+        completer=slash_completer(),
+        # The menu is only ever offered for lines starting with "/", so opening
+        # it while you type costs an ordinary message nothing.
+        complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
+        reserve_space_for_menu=8,
     )
 
     thinking_on = think
