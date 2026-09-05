@@ -32,13 +32,23 @@ class _StepReporter:
         self.emit({"type": "progress", "step": min(int(t) + 1, self.total), "total": self.total})
 
 
-def _image_size(path: str) -> tuple[int, int]:
-    """Pixel dimensions of a base image, rounded to the multiple of 16 that
-    mflux's latent grid requires."""
+def _source_size(path: str, budget: int) -> tuple[int, int]:
+    """Dimensions to redraw a base image at: its own shape, scaled down to fit
+    within `budget` pixels, on the multiple-of-16 grid mflux's latents need.
+
+    The budget is what keeps an edit from failing before the first step. At full
+    resolution a 3030x2670 phone photo is a ~31k-token latent grid, and one
+    attention matrix over it is tens of GB - past the Metal buffer limit, so
+    mflux raises "greater than the maximum allowed buffer size" instead of
+    generating anything.
+    """
     from PIL import Image
 
     with Image.open(path) as im:
         w, h = im.size
+    if w * h > budget:
+        scale = (budget / (w * h)) ** 0.5
+        w, h = round(w * scale), round(h * scale)
     return max(16, (w // 16) * 16), max(16, (h // 16) * 16)
 
 
@@ -115,9 +125,14 @@ class ImageEngine:
             # Working from a base image: match its shape unless told otherwise,
             # so the result is a variation rather than a reframing.
             if width is None or height is None:
-                src_w, src_h = _image_size(init_image)
+                src_w, src_h = _source_size(
+                    init_image, self.cfg.width * self.cfg.height
+                )
                 width = width or src_w
                 height = height or src_h
+                # The result can be smaller than the base image, so say so
+                # rather than letting it look like a silent crop.
+                yield {"type": "status", "text": f"redrawing at {width}x{height}"}
             if image_strength is None:
                 image_strength = self.cfg.image_strength
         width = width or self.cfg.width

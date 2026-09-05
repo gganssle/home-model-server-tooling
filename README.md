@@ -166,6 +166,12 @@ hearth image "the same barn in winter" --from barn.png --strength 0.5
 `--strength` is how far it may move from the original, 0 to 1. Low values stay
 close; high values barely resemble it.
 
+The result keeps the base image's shape, but is scaled to fit the pixel budget
+of the configured `width` x `height` (1024x1024 by default). A camera-sized
+photo redrawn at full resolution asks for more memory than Metal will hand out
+in one buffer, and the generation fails before the first step. Pass `--width`
+and `--height` to override.
+
 In a conversation, `/edit make the sky stormier` works on the newest image in
 that thread — in the REPL and the web UI both. In the web UI, **Use as base**
 under any generated image loads it into the composer with a strength slider.

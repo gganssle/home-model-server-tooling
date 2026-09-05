@@ -242,6 +242,33 @@ check("/edit with nothing to edit is refused",
 check("bare /edit is refused",
       client.post(f"/api/threads/{et}/messages", json={"content": "/edit"}).status_code == 400)
 
+print("\nbase image sizing")
+from PIL import Image  # noqa: E402
+
+from hearth.engine.image import _source_size  # noqa: E402
+
+big = TMP / "big.png"
+Image.new("RGB", (3030, 2670), (10, 20, 30)).save(big)
+bw, bh = _source_size(str(big), 1024 * 1024)
+# A phone photo at full resolution asks mflux for a latent grid so large that
+# attention over it exceeds the Metal buffer limit; it has to be scaled down.
+check("an oversized base image is brought under the pixel budget",
+      bw * bh <= 1024 * 1024, f"{bw}x{bh}")
+check("its aspect ratio survives",
+      abs((bw / bh) - (3030 / 2670)) < 0.02, f"{bw}x{bh}")
+check("the scaled size sits on the multiple-of-16 grid",
+      bw % 16 == 0 and bh % 16 == 0, f"{bw}x{bh}")
+
+small = TMP / "small.png"
+Image.new("RGB", (600, 400), (10, 20, 30)).save(small)
+check("a small base image keeps its own size", _source_size(str(small), 1024 * 1024) == (592, 400),
+      str(_source_size(str(small), 1024 * 1024)))
+
+tiny = TMP / "tiny.png"
+Image.new("RGB", (8, 8), (10, 20, 30)).save(tiny)
+check("a tiny base image still yields a legal grid", _source_size(str(tiny), 1024 * 1024) == (16, 16),
+      str(_source_size(str(tiny), 1024 * 1024)))
+
 print("\nOpenAI multimodal content")
 oai = client.post("/v1/chat/completions", json={"model": "x", "messages": [
     {"role": "user", "content": [
