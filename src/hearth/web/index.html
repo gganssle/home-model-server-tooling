@@ -112,6 +112,31 @@
   #toolbar { display: flex; gap: 14px; align-items: center; font-size: 12.5px; color: var(--fg-dim); }
   #toolbar label { display: flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
   .hint { margin-left: auto; color: var(--fg-faint); }
+
+  /* ---------- attachments ---------- */
+  #attachments { display: flex; gap: 8px; flex-wrap: wrap; }
+  #attachments:empty { display: none; }
+  .thumb { position: relative; width: 56px; height: 56px; border-radius: 8px;
+    overflow: hidden; border: 1px solid var(--border); background: var(--bg-inset); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .x { position: absolute; top: 1px; right: 1px; width: 17px; height: 17px;
+    border: none; border-radius: 50%; background: rgba(0,0,0,.66); color: #fff;
+    font-size: 12px; line-height: 17px; padding: 0; cursor: pointer; }
+  .thumb .x:hover { background: var(--danger); }
+  #attach-btn { border: none; background: none; color: var(--fg-dim); cursor: pointer;
+    font-size: 17px; padding: 4px 6px; border-radius: 6px; line-height: 1; }
+  #attach-btn:hover { background: var(--bg-inset); color: var(--fg); }
+  #strengthrow { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+    color: var(--fg-dim); }
+  #strengthrow input[type=range] { flex: 1; max-width: 190px; }
+  body.dragging #messages { outline: 2px dashed var(--accent); outline-offset: -10px; }
+  .msg .atts { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .msg .atts img { max-height: 150px; border-radius: 8px; border: 1px solid var(--border); }
+  .imgactions { margin-top: 6px; }
+  .imgactions button { font: inherit; font-size: 12px; padding: 3px 9px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--bg-alt); color: var(--fg-dim);
+    border-radius: 6px; }
+  .imgactions button:hover { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -128,22 +153,33 @@
   <div id="messages"><div class="wrap" id="mlist"></div></div>
   <div id="composer">
     <div class="wrap">
+      <div id="attachments"></div>
       <div id="inputrow">
+        <button id="attach-btn" title="Attach an image">&#128206;</button>
         <textarea id="input" rows="1" placeholder="Send a message, or describe an image..."></textarea>
         <button id="send">Send</button>
+      </div>
+      <div id="strengthrow" hidden>
+        <label for="strength">Keep to the original</label>
+        <input type="range" id="strength" min="0.1" max="0.95" step="0.05" value="0.6">
+        <span id="strengthval">0.60</span>
       </div>
       <div id="toolbar">
         <label><input type="checkbox" id="imgmode"> Image mode</label>
         <label><input type="checkbox" id="thinkmode"> Reasoning</label>
-        <span class="hint">Enter to send &middot; Shift+Enter for a new line</span>
+        <span class="hint">Enter to send &middot; drop, paste or attach an image</span>
       </div>
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
     </div>
   </div>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { thread: null, threads: [], busy: false, abort: null };
+// `attachments` holds what is queued in the composer. Each entry is either a
+// freshly read file ({src}) or a reference to an image the server already has
+// ({ref}), which is how "use as base" avoids re-uploading.
+const state = { thread: null, threads: [], busy: false, abort: null, attachments: [] };
 
 // ---------------- markdown (small, deliberate subset) ----------------
 function esc(s) {
@@ -187,6 +223,34 @@ function el(tag, cls, html) {
   return n;
 }
 
+// An attachment reference is a stored filename, or already a URL when we are
+// optimistically rendering a message the server has not stored yet.
+function attSrc(name) {
+  return /^(data:|https?:|\/)/.test(name) ? name : "/api/images/" + name;
+}
+
+function imageStats(m) {
+  const bits = ["seed " + m.seed, m.steps + " steps",
+                m.width + "x" + m.height, m.elapsed_s + "s"];
+  if (m.from_image) bits.unshift("from " + m.from_image + " @ " + m.image_strength);
+  return bits.join(" &middot; ");
+}
+
+// Queue a generated image as the base for the next one, without re-uploading it.
+function useAsBase(name) {
+  const wrap = el("div", "imgactions");
+  const b = el("button", null, "Use as base");
+  b.title = "Generate a variation of this image";
+  b.onclick = () => {
+    state.attachments = [{ ref: name, url: "/api/images/" + name }];
+    $("imgmode").checked = true;
+    syncComposer();
+    $("input").focus();
+  };
+  wrap.appendChild(b);
+  return wrap;
+}
+
 function renderMessage(m) {
   const node = el("div", "msg " + m.role);
   node.appendChild(el("div", "role", m.role === "user" ? "you" : "model"));
@@ -198,16 +262,26 @@ function renderMessage(m) {
     d.appendChild(el("div", "think-body", esc(meta.thinking)));
     body.appendChild(d);
   }
+  const atts = meta.images || [];
+  if (atts.length) {
+    const row = el("div", "atts");
+    for (const name of atts) {
+      const t = el("img");
+      t.src = attSrc(name);
+      t.alt = "attached image";
+      row.appendChild(t);
+    }
+    body.appendChild(row);
+  }
   if (m.image) {
     const img = el("img", "gen");
     img.src = "/api/images/" + m.image;
     img.alt = meta.prompt || "generated image";
     body.appendChild(img);
     if (meta.seed !== undefined) {
-      body.appendChild(el("div", "stats",
-        "seed " + meta.seed + " &middot; " + meta.steps + " steps &middot; " +
-        meta.width + "x" + meta.height + " &middot; " + meta.elapsed_s + "s"));
+      body.appendChild(el("div", "stats", imageStats(meta)));
     }
+    body.appendChild(useAsBase(m.image));
   }
   if (m.content) {
     body.appendChild(el("div", null,
@@ -297,6 +371,46 @@ async function ensureThread() {
   return t.id;
 }
 
+// ---------------- composer attachments ----------------
+function syncComposer() {
+  const box = $("attachments");
+  box.innerHTML = "";
+  for (const [i, att] of state.attachments.entries()) {
+    const t = el("div", "thumb");
+    const img = el("img");
+    img.src = att.url;
+    img.alt = "attachment";
+    t.appendChild(img);
+    const x = el("button", "x", "&times;");
+    x.title = "Remove";
+    x.onclick = () => { state.attachments.splice(i, 1); syncComposer(); };
+    t.appendChild(x);
+    box.appendChild(t);
+  }
+  // The strength control only means anything when generating *from* an image.
+  const editing = $("imgmode").checked && state.attachments.length > 0;
+  $("strengthrow").hidden = !editing;
+  $("input").placeholder = editing
+    ? "Describe the change to make..."
+    : $("imgmode").checked
+      ? "Describe the image to generate..."
+      : state.attachments.length
+        ? "Ask about the attached image..."
+        : "Send a message, or describe an image...";
+}
+
+function addFiles(files) {
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.attachments.push({ src: reader.result, url: reader.result });
+      syncComposer();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
 // ---------------- streaming ----------------
 async function streamSSE(url, body, onEvent) {
   state.abort = new AbortController();
@@ -342,19 +456,24 @@ async function send() {
   }
 
   const text = $("input").value.trim();
-  if (!text) return;
+  const atts = state.attachments.slice();
+  if (!text && !atts.length) return;
   const imageMode = $("imgmode").checked;
   const think = $("thinkmode").checked;
+  const editing = imageMode && atts.length > 0;
 
   const id = await ensureThread();
   $("input").value = "";
   $("input").style.height = "auto";
+  state.attachments = [];
+  syncComposer();
 
   const list = $("mlist");
   if (list.querySelector(".empty")) list.innerHTML = "";
   list.appendChild(renderMessage({
     role: "user",
-    content: imageMode ? "/image " + text : text,
+    content: imageMode ? (editing ? "/edit " : "/image ") + text : text,
+    meta: { images: atts.map((a) => a.url) },
   }));
   scrollDown(true);
 
@@ -421,10 +540,9 @@ async function send() {
           m.tokens_per_second + " tok/s &middot; " + m.generation_tokens +
           " tokens &middot; " + m.elapsed_s + "s"));
       } else if (m.seed !== undefined) {
-        body.appendChild(el("div", "stats",
-          "seed " + m.seed + " &middot; " + m.steps + " steps &middot; " +
-          m.width + "x" + m.height + " &middot; " + m.elapsed_s + "s"));
+        body.appendChild(el("div", "stats", imageStats(m)));
       }
+      if (ev.image) body.appendChild(useAsBase(ev.image));
       loadThreads();
       scrollDown(false);
       return;
@@ -440,10 +558,18 @@ async function send() {
 
   try {
     if (imageMode) {
-      await streamSSE("/api/images", { prompt: text, thread_id: id }, onEvent);
+      const body = { prompt: text, thread_id: id };
+      if (editing) {
+        // A queued attachment is either bytes we just read or a name the
+        // server already has; both are valid init_image references.
+        body.init_image = atts[0].ref || atts[0].src;
+        body.image_strength = parseFloat($("strength").value);
+      }
+      await streamSSE("/api/images", body, onEvent);
     } else {
-      await streamSSE("/api/threads/" + id + "/messages",
-        { content: text, thinking: think }, onEvent);
+      const body = { content: text, thinking: think };
+      if (atts.length) body.images = atts.map((a) => a.ref || a.src);
+      await streamSSE("/api/threads/" + id + "/messages", body, onEvent);
     }
   } catch (e) {
     if (e.name !== "AbortError") {
@@ -476,6 +602,8 @@ async function poll() {
 $("send").onclick = send;
 $("new-btn").onclick = () => {
   state.thread = null;
+  state.attachments = [];
+  syncComposer();
   showEmpty();
   drawThreads($("search").value);
   $("input").focus();
@@ -488,13 +616,49 @@ $("input").addEventListener("input", (e) => {
   e.target.style.height = "auto";
   e.target.style.height = Math.min(e.target.scrollHeight, 200) + "px";
 });
-$("imgmode").addEventListener("change", (e) => {
-  $("input").placeholder = e.target.checked
-    ? "Describe the image to generate..."
-    : "Send a message, or describe an image...";
+$("imgmode").addEventListener("change", syncComposer);
+
+// ---------------- attaching images ----------------
+$("attach-btn").onclick = () => $("file-input").click();
+$("file-input").addEventListener("change", (e) => {
+  addFiles(e.target.files);
+  e.target.value = "";   // so picking the same file twice still fires
+});
+
+$("strength").addEventListener("input", (e) => {
+  $("strengthval").textContent = parseFloat(e.target.value).toFixed(2);
+});
+
+// Paste an image straight into the composer.
+$("input").addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+
+// Drag and drop anywhere over the page.
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => {
+  if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
+  e.preventDefault();
+  dragDepth++;
+  document.body.classList.add("dragging");
+});
+window.addEventListener("dragover", (e) => {
+  if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault();
+});
+window.addEventListener("dragleave", () => {
+  if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
+});
+window.addEventListener("drop", (e) => {
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove("dragging");
+  addFiles(e.dataTransfer.files);
 });
 
 showEmpty();
+syncComposer();
 loadThreads();
 poll();
 setInterval(poll, 4000);

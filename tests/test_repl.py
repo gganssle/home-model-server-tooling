@@ -124,6 +124,8 @@ def main() -> int:
         repl.buf = ""
         repl.send("/help")
         check("/help lists commands", repl.read_until("/switch"), repr(repl.buf[-300:]))
+        check("/help lists /attach", repl.read_until("/attach"), repr(repl.buf[-400:]))
+        check("/help lists /edit", repl.read_until("/edit"), repr(repl.buf[-400:]))
 
         repl.buf = ""
         repl.send("/think on")
@@ -143,10 +145,56 @@ def main() -> int:
         repl.send("/threads")
         check("/threads lists the thread", repl.read_until("Arithmetic"), repr(repl.buf[-300:]))
 
+        print("\nattachments")
+        from test_integration_stubs import SAMPLE_PNG
+        pic = TMP / "photo.png"
+        pic.parent.mkdir(parents=True, exist_ok=True)
+        pic.write_bytes(SAMPLE_PNG)
+
+        repl.buf = ""
+        repl.send(f"/attach {pic}")
+        check("/attach queues the image", repl.read_until("attached photo.png"),
+              repr(repl.buf[-300:]))
+        repl.buf = ""
+        repl.send("/attach")
+        check("/attach with no argument lists the queue",
+              repl.read_until("queued for the next message"), repr(repl.buf[-300:]))
+        repl.buf = ""
+        repl.send("what is this?")
+        check("the queued image goes with the next message",
+              repl.read_until("saw 1 image(s)"), repr(repl.buf[-400:]))
+        repl.buf = ""
+        repl.send("and now?")
+        check("the queue is emptied after sending",
+              repl.read_until("saw 1 image(s)"), repr(repl.buf[-400:]))
+
+        repl.buf = ""
+        repl.send(f"/attach {pic}")
+        repl.read_until("attached")
+        repl.buf = ""
+        repl.send("/detach")
+        check("/detach clears the queue", repl.read_until("cleared 1 attachment"),
+              repr(repl.buf[-200:]))
+
+        repl.buf = ""
+        repl.send(f"/attach {TMP}/missing.png")
+        check("a bad path is reported", repl.read_until("no such file"), repr(repl.buf[-200:]))
+
         repl.buf = ""
         repl.send("/image a red barn")
         check("/image reports progress", repl.read_until("step"), repr(repl.buf[-300:]))
         check("/image reports the saved file", repl.read_until("image:"), repr(repl.buf[-300:]))
+
+        print("\nediting an image")
+        repl.buf = ""
+        repl.send("/edit make it stormier")
+        check("/edit reports progress", repl.read_until("step"), repr(repl.buf[-300:]))
+        check("/edit names the base image", repl.read_until("from "), repr(repl.buf[-300:]))
+
+        repl.buf = ""
+        repl.send("/edit")
+        check("bare /edit explains itself", repl.read_until("usage: /edit"),
+              repr(repl.buf[-200:]))
 
         repl.buf = ""
         repl.send("/new")

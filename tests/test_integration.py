@@ -151,6 +151,111 @@ check("openai stream shape", streamed == "you said: ping", repr(streamed))
 check("openai stream terminates", "[DONE]" in r.text)
 check("models listed", len(client.get("/v1/models").json()["data"]) == 2)
 
+print("\nimage input (vision)")
+import base64  # noqa: E402
+from test_integration_stubs import SAMPLE_PNG  # noqa: E402
+
+DATA_URI = "data:image/png;base64," + base64.b64encode(SAMPLE_PNG).decode()
+
+vt = client.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+r = client.post(f"/api/threads/{vt}/messages",
+                json={"content": "what is this?", "images": [DATA_URI]})
+events = sse_events(r)
+final = [e for e in events if e["type"] == "done"][0]
+check("engine received the image", final["meta"].get("images") == 1, str(final["meta"]))
+check("image marker landed on the user turn", final["meta"].get("markers") == 1,
+      str(final["meta"]))
+
+msgs = client.get(f"/api/threads/{vt}").json()["messages"]
+stored = (msgs[0].get("meta") or {}).get("images") or []
+check("attachment recorded on the message", len(stored) == 1, str(msgs[0]))
+check("attachment is served back", client.get(f"/api/images/{stored[0]}").status_code == 200)
+check("attachment survives a reload",
+      (client.get(f"/api/threads/{vt}").json()["messages"][0]["meta"]["images"] == stored))
+
+print("\nimages persist across turns")
+r = client.post(f"/api/threads/{vt}/messages", json={"content": "and its colour?"})
+final = [e for e in sse_events(r) if e["type"] == "done"][0]
+check("earlier image still reaches the model", final["meta"].get("images") == 1,
+      str(final["meta"]))
+check("marker stayed on the original turn", final["meta"].get("markers") == 1,
+      str(final["meta"]))
+
+print("\nmultiple images in one turn")
+r = client.post(f"/api/threads/{vt}/messages",
+                json={"content": "compare these", "images": [DATA_URI, DATA_URI]})
+final = [e for e in sse_events(r) if e["type"] == "done"][0]
+# 1 carried from the first turn + 2 new, and markers must match paths exactly.
+check("all images reach the model", final["meta"].get("images") == 3, str(final["meta"]))
+check("markers match image count",
+      final["meta"].get("markers") == final["meta"].get("images"), str(final["meta"]))
+
+print("\nhistory image budget")
+# max_history_images defaults to 4; a fifth attachment pushes the oldest out.
+for i in range(3):
+    client.post(f"/api/threads/{vt}/messages",
+                json={"content": f"another {i}", "images": [DATA_URI]}).read()
+r = client.post(f"/api/threads/{vt}/messages", json={"content": "and now?"})
+final = [e for e in sse_events(r) if e["type"] == "done"][0]
+check("image count is capped", final["meta"].get("images") == 4, str(final["meta"]))
+check("markers still match after trimming",
+      final["meta"].get("markers") == final["meta"].get("images"), str(final["meta"]))
+
+print("\nattachment validation")
+check("an image-only message is allowed",
+      client.post(f"/api/threads/{vt}/messages",
+                  json={"content": "", "images": [DATA_URI]}).status_code == 200)
+check("non-image bytes are refused",
+      client.post(f"/api/threads/{vt}/messages", json={
+          "content": "x",
+          "images": ["data:image/png;base64," + base64.b64encode(b"not a png").decode()],
+      }).status_code == 400)
+check("missing file is refused",
+      client.post(f"/api/threads/{vt}/messages",
+                  json={"content": "x", "images": ["/nope/missing.png"]}).status_code == 400)
+
+print("\nimg2img")
+et = client.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+r = client.post("/api/images", json={"prompt": "a barn", "thread_id": et, "steps": 2})
+base_name = [e for e in sse_events(r) if e["type"] == "done"][0]["image"]
+r = client.post("/api/images", json={
+    "prompt": "the same barn in winter", "thread_id": et, "steps": 2,
+    "init_image": base_name, "image_strength": 0.4,
+})
+final = [e for e in sse_events(r) if e["type"] == "done"][0]
+check("base image passed through", final["meta"].get("from_image") == base_name,
+      str(final["meta"]))
+check("strength passed through", final["meta"].get("image_strength") == 0.4,
+      str(final["meta"]))
+check("strength is range-checked",
+      client.post("/api/images", json={"prompt": "x", "image_strength": 3.0}).status_code == 422)
+
+print("\n/edit chat shortcut")
+r = client.post(f"/api/threads/{et}/messages", json={"content": "/edit make it stormier"})
+final = [e for e in sse_events(r) if e["type"] == "done"][0]
+check("/edit uses the newest image in the thread",
+      final["meta"].get("from_image") is not None, str(final["meta"]))
+empty = client.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+check("/edit with nothing to edit is refused",
+      client.post(f"/api/threads/{empty}/messages",
+                  json={"content": "/edit something"}).status_code == 400)
+check("bare /edit is refused",
+      client.post(f"/api/threads/{et}/messages", json={"content": "/edit"}).status_code == 400)
+
+print("\nOpenAI multimodal content")
+oai = client.post("/v1/chat/completions", json={"model": "x", "messages": [
+    {"role": "user", "content": [
+        {"type": "text", "text": "describe it"},
+        {"type": "image_url", "image_url": {"url": DATA_URI}},
+    ]}]}).json()
+check("openai image_url reaches the model",
+      "1 image(s)" in oai["choices"][0]["message"]["content"],
+      json.dumps(oai)[:250])
+check("openai text-only still works",
+      "you said: hi" in client.post("/v1/chat/completions", json={
+          "model": "x", "messages": [{"role": "user", "content": "hi"}]},
+      ).json()["choices"][0]["message"]["content"])
+
 print("\nstrict request fields")
 check("unknown chat field is rejected",
       client.post(f"/api/threads/{tid}/messages",

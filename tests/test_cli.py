@@ -145,6 +145,32 @@ def main() -> int:
         check("png written to disk", out.exists() and out.read_bytes()[:4] == b"\x89PNG")
         check("path printed to stdout", str(out) in r.stdout, repr(r.stdout[:200]))
 
+        print("\nimage input")
+        from test_integration_stubs import SAMPLE_PNG
+        pic = TMP / "photo.png"
+        pic.write_bytes(SAMPLE_PNG)
+        r = run("ask", "-i", str(pic), "what is this?")
+        check("ask -i sends the image", "saw 1 image(s)" in r.stdout, repr(r.stdout[:200]))
+        r = run("ask", "-i", str(pic), "-i", str(pic), "compare these")
+        check("ask -i is repeatable", "saw 2 image(s)" in r.stdout, repr(r.stdout[:200]))
+        r = run("ask", "-i", str(TMP / "nope.png"), "hello")
+        check("a missing attachment is reported", r.returncode != 0
+              and "no such image" in (r.stderr + r.stdout).lower(),
+              repr((r.stderr + r.stdout)[:200]))
+        r = run("ask", "-i", str(pic))
+        check("an image with no prompt is allowed", r.returncode == 0, r.stderr[:200])
+
+        print("\nimg2img")
+        base = TMP / "base.png"
+        r = run("image", "a barn", "-o", str(base), "--steps", "2")
+        check("base image generated", base.exists(), r.stderr[:200])
+        out2 = TMP / "variation.png"
+        r = run("image", "the same barn in winter", "--from", str(base),
+                "--strength", "0.4", "-o", str(out2), "--steps", "2")
+        check("--from succeeds", r.returncode == 0, r.stderr[:300])
+        check("variation written", out2.exists() and out2.read_bytes()[:4] == b"\x89PNG")
+        check("base image reported", "from " in r.stderr, repr(r.stderr[:200]))
+
         print("\nsearch")
         r = run("search", "hello")
         check("search finds the message", "hello" in r.stdout, repr(r.stdout[:200]))
@@ -166,6 +192,11 @@ def main() -> int:
 
         print("\nhelp surfaces every command")
         r = run("--help")
+        r2 = run("ask", "--help")
+        check("ask documents --image", "--image" in r2.stdout, r2.stdout[:400])
+        r2 = run("image", "--help")
+        check("image documents --from", "--from" in r2.stdout, r2.stdout[:400])
+        check("image documents --strength", "--strength" in r2.stdout, r2.stdout[:400])
         for cmd in ("chat", "ask", "image", "threads", "serve", "pull", "status"):
             check(f"help lists {cmd}", cmd in r.stdout, r.stdout[:400])
 

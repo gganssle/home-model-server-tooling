@@ -142,6 +142,40 @@ def render_stream(
     return final
 
 
+MIME_BY_SUFFIX = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
+}
+
+
+def to_data_uri(path: Path) -> str:
+    """Read a local image into a data: URI.
+
+    Sending bytes rather than a path means attachments work unchanged when the
+    server is on another machine, which is the whole point of HEARTH_HOST.
+    """
+    import base64
+
+    resolved = path.expanduser()
+    if not resolved.is_file():
+        fail(f"no such image: {path}")
+    mime = MIME_BY_SUFFIX.get(resolved.suffix.lower(), "image/png")
+    payload = base64.b64encode(resolved.read_bytes()).decode()
+    return f"data:{mime};base64,{payload}"
+
+
+def image_ref(value: str) -> str:
+    """Accept a local file or a name the server already knows.
+
+    A path that exists here is uploaded; anything else is passed through for
+    the server to resolve against images it already has.
+    """
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        return to_data_uri(candidate)
+    return value
+
+
 def show_inline(data: bytes) -> bool:
     """Draw an image in the terminal if it speaks a graphics protocol.
 
@@ -241,17 +275,27 @@ def ask(
     prompt: Optional[str] = typer.Argument(None, help="Prompt. Omit to read stdin."),
     thread: Optional[str] = typer.Option(None, "--thread", "-t", help="Continue a thread (id, prefix, or 'last')."),
     new: bool = typer.Option(False, "--new", "-n", help="Force a fresh throwaway thread."),
+    images: Optional[list[Path]] = typer.Option(
+        None, "--image", "-i",
+        help="Attach an image for the model to look at. Repeatable.",
+    ),
     think: Optional[bool] = typer.Option(None, "--think/--no-think", help="Toggle reasoning mode."),
     max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
     temperature: Optional[float] = typer.Option(None, "--temperature"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Answer only: no stats, no reasoning."),
 ) -> None:
-    """One-shot question. Pipe-friendly: `cat bug.log | hearth ask 'what broke?'`"""
+    """One-shot question. Pipe-friendly: `cat bug.log | hearth ask 'what broke?'`
+
+    Attach images with -i to ask about them:
+    `hearth ask -i chart.png "what is the trend?"`
+    """
     stdin_text = _read_stdin(required=prompt is None)
 
+    attachments = [to_data_uri(p) for p in (images or [])]
+
     parts = [p for p in (prompt, stdin_text) if p]
-    if not parts:
-        fail("no prompt given (pass an argument or pipe text in)")
+    if not parts and not attachments:
+        fail("no prompt given (pass an argument, pipe text in, or attach an image)")
     content = "\n\n".join(parts)
 
     plain = quiet or not is_tty()
@@ -261,7 +305,7 @@ def ask(
             ref = _pick_thread(client, thread, new)
             final = render_stream(
                 client.send(ref, content, thinking=think, max_tokens=max_tokens,
-                            temperature=temperature),
+                            temperature=temperature, images=attachments or None),
                 client,
                 show_thinking=not plain,
                 plain=plain,
@@ -289,15 +333,27 @@ def image(
     height: Optional[int] = typer.Option(None, "--height"),
     seed: Optional[int] = typer.Option(None, "--seed"),
     negative: Optional[str] = typer.Option(None, "--negative", help="Negative prompt."),
+    from_image: Optional[str] = typer.Option(
+        None, "--from", help="Start from this image (a local file, or one already in a thread)."
+    ),
+    strength: Optional[float] = typer.Option(
+        None, "--strength",
+        help="How far to move from --from, 0-1. Low stays close to the original.",
+    ),
     open_after: bool = typer.Option(False, "--open", help="Open the result when done (macOS)."),
 ) -> None:
-    """Generate an image."""
+    """Generate an image, or vary an existing one with --from.
+
+    `hearth image "the same barn in winter" --from barn.png --strength 0.5`
+    """
     with get_client() as client:
         try:
             final = render_stream(
                 client.image(
                     prompt, thread_id=thread, steps=steps, width=width,
                     height=height, seed=seed, negative_prompt=negative,
+                    init_image=image_ref(from_image) if from_image else None,
+                    image_strength=strength,
                 ),
                 client,
                 plain=not is_tty(),
@@ -315,11 +371,14 @@ def image(
         show_inline(data)
         print(str(dest.resolve()))
         meta = final.get("meta", {})
-        if is_tty():
-            err.print(
-                f"[dim]seed {meta.get('seed')} - {meta.get('steps')} steps"
-                f" - {meta.get('elapsed_s')}s[/dim]"
-            )
+        bits = [
+            f"seed {meta.get('seed')}",
+            f"{meta.get('steps')} steps",
+            f"{meta.get('elapsed_s')}s",
+        ]
+        if meta.get("from_image"):
+            bits.insert(0, f"from {meta['from_image']} @ {meta.get('image_strength')}")
+        err.print(f"[dim]{' - '.join(bits)}[/dim]")
         if open_after:
             import subprocess
             subprocess.run(["open", str(dest.resolve())], check=False)
@@ -376,6 +435,8 @@ def _print_message(m: dict[str, Any]) -> None:
         role, f"[bold]{role}[/bold]"
     )
     console.print(f"{label}:")
+    for name in (m.get("meta") or {}).get("images", []) or []:
+        console.print(f"  [cyan]<attached {name}>[/cyan]")
     if m.get("image"):
         console.print(f"  [cyan]<image {m['image']}>[/cyan]")
     if m["content"]:
@@ -558,6 +619,9 @@ REPL_HELP = """
   /threads            list conversations
   /switch <ref>       jump to another conversation (id, prefix, or 'last')
   /image <prompt>     generate an image in this conversation
+  /attach <path>      queue an image for the model to look at
+  /detach             drop queued attachments
+  /edit <prompt>      redraw the newest image in this conversation
   /think on|off       toggle reasoning mode
   /retry              re-run your last message
   /title <text>       rename this conversation
@@ -616,18 +680,38 @@ def chat(
 
     thinking_on = think
     last_user_message: str | None = None
+    pending: list[Path] = []   # images queued by /attach for the next message
 
     def send(content: str) -> None:
+        """Send one turn, with any queued attachments, and render the reply.
+
+        `/image` and `/edit` go through here too: the server routes on the
+        leading verb, so the REPL and the web UI behave identically.
+        """
         nonlocal last_user_message
         last_user_message = content
+        attachments = [to_data_uri(p) for p in pending]
         console.print()
         final = render_stream(
-            client.send(thread["id"], content, thinking=thinking_on),
+            client.send(thread["id"], content, thinking=thinking_on,
+                        images=attachments or None),
             client,
             show_thinking=True,
         )
+        if attachments:
+            pending.clear()
+
         if final.get("type") == "done" and final.get("image"):
-            console.print(f"[cyan]image saved:[/cyan] {final['image']}")
+            data = client.download_image(final["image"])
+            dest = Path.cwd() / final["image"]
+            dest.write_bytes(data)
+            show_inline(data)
+            console.print(f"[cyan]image:[/cyan] {dest}")
+            meta = final.get("meta", {})
+            bits = [f"seed {meta.get('seed')}", f"{meta.get('elapsed_s')}s"]
+            if meta.get("from_image"):
+                bits.insert(0, f"from {meta['from_image']} @ {meta.get('image_strength')}")
+            console.print(f"[dim]{' - '.join(bits)}[/dim]")
         print_stats(final)
         console.print()
 
@@ -677,24 +761,40 @@ def chat(
                 continue
             console.print(f"[dim]switched to[/dim] [bold cyan]{thread['title']}[/bold cyan]\n")
 
-        elif cmd == "/image":
+        elif cmd in ("/image", "/edit"):
             if not rest:
-                console.print("[yellow]usage: /image <prompt>[/yellow]")
+                console.print(f"[yellow]usage: {cmd} <prompt>[/yellow]")
+                if cmd == "/edit":
+                    console.print("[dim]edits the newest image in this conversation, "
+                                  "or one queued with /attach[/dim]")
                 continue
-            console.print()
-            final = render_stream(
-                client.image(rest, thread_id=thread["id"]), client
+            # The server routes on the leading verb, so this is just a message.
+            send(line)
+
+        elif cmd == "/attach":
+            if not rest:
+                if pending:
+                    console.print("[dim]queued for the next message:[/dim]")
+                    for path in pending:
+                        console.print(f"  [cyan]{path}[/cyan]")
+                else:
+                    console.print("[dim]nothing queued - /attach <path> to add an image[/dim]")
+                console.print()
+                continue
+            candidate = Path(rest).expanduser()
+            if not candidate.is_file():
+                console.print(f"[red]no such file:[/red] {candidate}\n")
+                continue
+            pending.append(candidate)
+            console.print(
+                f"[dim]attached {candidate.name} "
+                f"({len(pending)} queued) - it goes with your next message[/dim]\n"
             )
-            if final.get("type") == "done":
-                data = client.download_image(final["image"])
-                dest = Path.cwd() / final["image"]
-                dest.write_bytes(data)
-                show_inline(data)
-                console.print(f"[cyan]image:[/cyan] {dest}")
-                meta = final.get("meta", {})
-                console.print(
-                    f"[dim]seed {meta.get('seed')} - {meta.get('elapsed_s')}s[/dim]\n"
-                )
+
+        elif cmd == "/detach":
+            count = len(pending)
+            pending.clear()
+            console.print(f"[dim]cleared {count} attachment(s)[/dim]\n")
 
         elif cmd == "/think":
             if rest in ("on", "true", "1"):

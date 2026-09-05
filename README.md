@@ -1,7 +1,8 @@
 # hearth
 
-A small, self-hosted chat app for your own models. Text and image generation,
-conversation threads, a web UI, and a CLI that works well over SSH.
+A small, self-hosted chat app for your own models. Chat, image generation,
+image understanding, conversation threads, a web UI, and a CLI that works well
+over SSH.
 
 Built for Apple Silicon: text runs on [mlx-vlm](https://github.com/Blaizzy/mlx-vlm),
 images on [mflux](https://github.com/filipstrand/mflux), both MLX-native.
@@ -78,7 +79,11 @@ hearth chat t_9f2            # resume by id (a unique prefix is enough)
 hearth ask "explain kubelet in two sentences"
 hearth ask --thread last "and how does that differ from kube-proxy?"
 
+hearth ask -i screenshot.png "what is this error telling me?"
+hearth ask -i before.png -i after.png "what changed?"
+
 hearth image "a lighthouse in fog, 35mm" -o lighthouse.png --open
+hearth image "the same lighthouse at night" --from lighthouse.png --strength 0.5
 
 hearth threads               # list conversations
 hearth show last             # print a transcript
@@ -105,6 +110,9 @@ git diff | hearth ask "write a commit message"
 /threads            list conversations
 /switch <ref>       jump to another conversation
 /image <prompt>     generate an image in this conversation
+/attach <path>      queue an image for the model to look at
+/detach             drop queued attachments
+/edit <prompt>      redraw the newest image in this conversation
 /think on|off       toggle reasoning mode
 /retry              re-run your last message
 /title <text>       rename this conversation
@@ -119,14 +127,53 @@ is kept.
 
 ## Images
 
+### Generating
+
 Three ways in, all landing in the same place:
 
 - `hearth image "a red barn at dusk"`
 - `/image a red barn at dusk` — inside a chat, in the REPL or the web UI
 - The **Image mode** checkbox in the web UI
 
-Generated PNGs live in `~/.local/share/hearth/images/` and are attached to the
-conversation they were made in.
+### Understanding
+
+The text model is a vision model, so it can look at images as well as write
+about them:
+
+```bash
+hearth ask -i chart.png "what is the trend here?"
+hearth ask -i a.jpg -i b.jpg "which of these is sharper?"
+```
+
+In the REPL, `/attach path/to/image.png` queues an image for your next message.
+In the web UI, drag an image onto the page, paste one from the clipboard, or use
+the paperclip.
+
+Attachments stay in context for follow-up questions — ask "and what colour is
+it?" without re-attaching. The most recent few are carried forward
+(`max_history_images`, default 4); older ones become a note in the transcript,
+because the vision tower re-encodes every image on every turn.
+
+### Editing
+
+Give a generation a starting image and it produces a variation rather than
+starting from noise:
+
+```bash
+hearth image "the same barn in winter" --from barn.png --strength 0.5
+```
+
+`--strength` is how far it may move from the original, 0 to 1. Low values stay
+close; high values barely resemble it.
+
+In a conversation, `/edit make the sky stormier` works on the newest image in
+that thread — in the REPL and the web UI both. In the web UI, **Use as base**
+under any generated image loads it into the composer with a strength slider.
+
+Generated and attached images live in `~/.local/share/hearth/images/` and are
+attached to the conversation they belong to. Attachments are copied in rather
+than referenced, so a conversation still renders after you move or delete the
+original.
 
 ## Reasoning mode
 
@@ -153,6 +200,7 @@ repo = "mlx-community/Qwen3.6-35B-A3B-8bit"
 max_tokens = 4096
 temperature = 0.7
 max_history_messages = 40
+max_history_images = 4     # attached images carried forward between turns
 enable_thinking = false
 system_prompt = "You are a helpful assistant running locally on the user's own machine."
 
@@ -162,6 +210,7 @@ steps = 20
 width = 1024
 height = 1024
 guidance = 4.0
+image_strength = 0.6       # default for --from / /edit, 0-1
 
 [memory]
 idle_evict_seconds = 900   # give memory back after 15 min idle; 0 to never
@@ -208,7 +257,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 `/v1/models` and both streaming and non-streaming `/v1/chat/completions` are
-implemented.
+implemented, including multimodal `image_url` content parts.
 
 ## Reaching it over SSH
 

@@ -121,8 +121,28 @@ class HearthClient:
                 body[key] = value
         return self._stream("POST", f"/api/threads/{ref}/messages", json=body)
 
-    def image(self, prompt: str, **kwargs: Any) -> Iterator[dict[str, Any]]:
-        body = {"prompt": prompt, **{k: v for k, v in kwargs.items() if v is not None}}
+    def image(
+        self,
+        prompt: str,
+        thread_id: str | None = None,
+        negative_prompt: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        steps: int | None = None,
+        guidance: float | None = None,
+        seed: int | None = None,
+        init_image: str | None = None,
+        image_strength: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        body: dict[str, Any] = {"prompt": prompt}
+        for key, value in (
+            ("thread_id", thread_id), ("negative_prompt", negative_prompt),
+            ("width", width), ("height", height), ("steps", steps),
+            ("guidance", guidance), ("seed", seed),
+            ("init_image", init_image), ("image_strength", image_strength),
+        ):
+            if value is not None:
+                body[key] = value
         return self._stream("POST", "/api/images", json=body)
 
     def download_image(self, filename: str) -> bytes:

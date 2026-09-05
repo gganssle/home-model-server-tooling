@@ -33,6 +33,10 @@ class TextModelConfig:
     top_p: float = 0.95
     # Trim history sent to the model so long threads don't blow the context window.
     max_history_messages: int = 40
+    # Attached images are re-encoded by the vision tower on every turn, which is
+    # slow, so only the most recent few are carried forward. Older ones become a
+    # text note in the transcript.
+    max_history_images: int = 4
     system_prompt: str = "You are a helpful assistant running locally on the user's own machine."
     # Qwen3.6 is a hybrid reasoning model. Thinking is off by default so chat
     # feels snappy; flip it per-request from the CLI (--think) or the web UI.
@@ -47,6 +51,9 @@ class ImageModelConfig:
     width: int = 1024
     height: int = 1024
     guidance: float = 4.0
+    # How far a generation may move from a supplied base image, 0-1. Low values
+    # stay close to the original; high values barely resemble it.
+    image_strength: float = 0.6
 
 
 @dataclass
@@ -97,6 +104,8 @@ def _apply_env(cfg: Config) -> None:
         "HEARTH_TEMPERATURE": (cfg.text, "temperature", float),
         "HEARTH_THINK": (cfg.text, "enable_thinking", lambda v: v.lower() in ("1", "true", "yes")),
         "HEARTH_IMAGE_STEPS": (cfg.image, "steps", int),
+        "HEARTH_IMAGE_STRENGTH": (cfg.image, "image_strength", float),
+        "HEARTH_MAX_HISTORY_IMAGES": (cfg.text, "max_history_images", int),
         "HEARTH_IDLE_EVICT": (cfg.memory, "idle_evict_seconds", int),
         "HEARTH_EXCLUSIVE": (cfg.memory, "exclusive", lambda v: v.lower() in ("1", "true", "yes")),
     }

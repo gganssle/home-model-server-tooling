@@ -153,6 +153,81 @@ def main() -> int:
             out.write_bytes(r.content)
             print(f"  saved to {out}", flush=True)
 
+        # ---------------- vision ----------------
+        # Draw something unambiguous with the image model, then ask the text
+        # model what it is. That exercises both models against each other and
+        # proves the attachment actually reached the vision tower.
+        print("\nvision: describing a generated image", flush=True)
+        with client.stream("POST", "/api/images", json={
+            "prompt": "a single ripe banana on a plain white background, centered, "
+                      "product photo",
+            "steps": 12, "width": 512, "height": 512,
+        }) as resp:
+            events = list(sse(resp))
+        subject = [e for e in events if e["type"] == "done"]
+        check("test subject generated", bool(subject), str(events[-1:]))
+        if subject:
+            name = subject[0]["image"]
+            vt = client.post("/api/threads", json={"title": "vision"}).json()["id"]
+            t0 = time.time()
+            with client.stream("POST", f"/api/threads/{vt}/messages", json={
+                "content": "What fruit is in this image? Reply with one word.",
+                "images": [name], "max_tokens": 32,
+            }) as resp:
+                events = list(sse(resp))
+            answer = [e for e in events if e["type"] == "done"][0]["content"]
+            print(f"  -> {answer!r}  ({time.time() - t0:.0f}s)", flush=True)
+            check("the model actually saw the image", "banana" in answer.lower(),
+                  repr(answer))
+
+            # A follow-up with no new attachment must still have the image in
+            # context, which is the multi-turn marker placement working.
+            with client.stream("POST", f"/api/threads/{vt}/messages", json={
+                "content": "What colour is it? One word.", "max_tokens": 32,
+            }) as resp:
+                events = list(sse(resp))
+            colour = [e for e in events if e["type"] == "done"][0]["content"]
+            print(f"  -> {colour!r}", flush=True)
+            check("the image is still in context on the next turn",
+                  "yellow" in colour.lower(), repr(colour))
+
+            stored = client.get(f"/api/threads/{vt}").json()["messages"][0]
+            check("attachment recorded on the message",
+                  (stored.get("meta") or {}).get("images") == [name], str(stored)[:200])
+
+            # ---------------- img2img ----------------
+            print("\nimg2img: varying an existing image", flush=True)
+            t0 = time.time()
+            with client.stream("POST", "/api/images", json={
+                "prompt": "the same banana, but painted in thick oil paint impasto",
+                "init_image": name, "image_strength": 0.55, "steps": 12,
+            }) as resp:
+                events = list(sse(resp))
+            varied = [e for e in events if e["type"] == "done"]
+            errs = [e for e in events if e["type"] == "error"]
+            if errs:
+                print("  error:", errs[0]["error"][:400], flush=True)
+            check("variation produced", bool(varied), str(errs[:1]))
+            if varied:
+                meta = varied[0]["meta"]
+                print(f"  -> {varied[0]['image']}  ({time.time() - t0:.0f}s)", flush=True)
+                check("variation records its base", meta.get("from_image") == name,
+                      str(meta))
+                check("variation records its strength", meta.get("image_strength") == 0.55,
+                      str(meta))
+                check("variation matched the base dimensions",
+                      meta.get("width") == 512 and meta.get("height") == 512, str(meta))
+                r = client.get(f"/api/images/{varied[0]['image']}")
+                check("variation is a real image",
+                      r.status_code == 200 and len(r.content) > 10_000,
+                      f"{len(r.content)} bytes")
+                base_bytes = client.get(f"/api/images/{name}").content
+                check("variation differs from its base", r.content != base_bytes)
+                out = Path.cwd() / "smoke-img2img.png"
+                out.write_bytes(r.content)
+                Path(Path.cwd() / "smoke-base.png").write_bytes(base_bytes)
+                print(f"  saved {out} and smoke-base.png", flush=True)
+
         st = client.get("/api/status").json()
         print(f"\n  memory with both models: {st['memory']['active_gb']} GB", flush=True)
         check("both models resident", st["text"]["loaded"] and st["image"]["loaded"],

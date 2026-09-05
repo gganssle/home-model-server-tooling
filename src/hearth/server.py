@@ -8,8 +8,10 @@ from the terminal.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
+import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +31,28 @@ log = logging.getLogger("hearth.server")
 
 WEB_DIR = Path(__file__).parent / "web"
 IMAGE_PREFIX = "/image "
+
+_EXT_BY_MIME = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+    "image/webp": "webp", "image/gif": "gif",
+}
+
+
+def _looks_like_image(path: Path) -> bool:
+    """Verify a file really is an image before we hand it to a model.
+
+    An attachment arrives as bytes from a browser or a path from a shell; both
+    can be something else entirely, and the failure deep inside the vision
+    tower is far less clear than a 400 here.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
 
 
 def sse(event: dict[str, Any]) -> str:
@@ -66,6 +90,10 @@ class ImageRequest(BaseModel):
     steps: int | None = None
     guidance: float | None = None
     seed: int | None = None
+    # img2img: a filename already in the image directory, a path, or a data URI.
+    init_image: str | None = None
+    # 0-1. Low stays close to the base image, high barely resembles it.
+    image_strength: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class OpenAIMessage(BaseModel):
@@ -163,43 +191,163 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
 
     # ---------------- chat ----------------
 
-    def _history_for_model(thread_id: str) -> list[dict[str, Any]]:
-        """Build the message list sent to the model.
+    def _history_for_model(thread_id: str) -> tuple[list[dict[str, Any]], list[str]]:
+        """Build the message list sent to the model, plus the images it refers to.
 
-        Image messages become a text placeholder: re-feeding generated images
-        back through the vision encoder every turn would be slow and is almost
-        never what the user means.
+        Attachments on a user turn are carried forward as `{"type": "image"}`
+        markers in that turn's content, which is how mlx-vlm knows which turn
+        each image belongs to. The returned paths must stay in the same order
+        as those markers.
+
+        Only the most recent few images are carried: the vision tower re-encodes
+        every one on every turn. Older attachments degrade to a text note so the
+        model still knows they existed.
+
+        Images the model *generated* are never fed back - they are described in
+        text instead, since asking about them is rare and re-encoding them every
+        turn is not.
         """
         msgs = store.get_messages(thread_id, limit=cfg.text.max_history_messages)
+
+        # Walk backwards to decide which attachments still fit the budget.
+        budget = max(0, cfg.text.max_history_images)
+        keep: set[str] = set()
+        for m in reversed(msgs):
+            if m.role != "user":
+                continue
+            for name in reversed((m.meta or {}).get("images", []) or []):
+                if len(keep) >= budget:
+                    break
+                keep.add(name)
+
         out: list[dict[str, Any]] = []
+        paths: list[str] = []
         if cfg.text.system_prompt:
             out.append({"role": "system", "content": cfg.text.system_prompt})
+
         for m in msgs:
-            content = m.content
+            content: Any = m.content
             if m.image and m.role == "assistant":
                 prompt = (m.meta or {}).get("prompt", "")
                 content = content or f"[generated an image: {prompt}]"
+
+            attached = (m.meta or {}).get("images", []) or [] if m.role == "user" else []
+            carried = [n for n in attached if n in keep and (cfg.image_dir / n).exists()]
+            dropped = len(attached) - len(carried)
+
+            if carried:
+                parts: list[dict[str, Any]] = [{"type": "image"} for _ in carried]
+                text = content or ""
+                if dropped:
+                    text = f"[{dropped} earlier image(s) omitted] {text}".strip()
+                parts.append({"type": "text", "text": text})
+                out.append({"role": m.role, "content": parts})
+                paths.extend(str(cfg.image_dir / n) for n in carried)
+                continue
+
+            if dropped:
+                content = f"[attached {dropped} image(s), no longer in context] {content or ''}".strip()
             if not content:
                 continue
             out.append({"role": m.role, "content": content})
-        return out
+
+        return out, paths
 
     def _materialize_images(images: list[str]) -> list[str]:
-        """Accept local paths or data: URIs; return paths mlx-vlm can open."""
-        paths = []
-        for item in images:
+        """Take attachments into the image directory and return their filenames.
+
+        Accepts a data: URI, a filename already in the image directory, or a
+        path on the server's filesystem. Everything is copied in rather than
+        referenced in place, so an attachment still renders after the original
+        is moved or deleted, and so it can be served over HTTP.
+        """
+        names: list[str] = []
+        cfg.image_dir.mkdir(parents=True, exist_ok=True)
+        for index, item in enumerate(images):
+            stamp = f"{int(time.time() * 1000)}_{index}"
             if item.startswith("data:"):
                 header, _, payload = item.partition(",")
-                ext = "png" if "png" in header else "jpg"
-                dest = cfg.image_dir / f"upload_{int(time.time()*1000)}_{len(paths)}.{ext}"
-                dest.write_bytes(base64.b64decode(payload))
-                paths.append(str(dest))
+                ext = _EXT_BY_MIME.get(header.split(";")[0].removeprefix("data:"), "png")
+                dest = cfg.image_dir / f"att_{stamp}.{ext}"
+                try:
+                    dest.write_bytes(base64.b64decode(payload, validate=True))
+                except (binascii.Error, ValueError) as exc:
+                    raise HTTPException(400, f"malformed data URI: {exc}") from exc
             else:
-                p = Path(item).expanduser()
-                if not p.exists():
+                # A bare filename may already be one of ours; prefer that over
+                # touching the wider filesystem.
+                existing = cfg.image_dir / Path(item).name
+                if "/" not in item and existing.exists():
+                    names.append(existing.name)
+                    continue
+                src = Path(item).expanduser()
+                if not src.is_file():
                     raise HTTPException(400, f"image not found: {item}")
-                paths.append(str(p))
-        return paths
+                suffix = src.suffix.lower().lstrip(".") or "png"
+                dest = cfg.image_dir / f"att_{stamp}.{suffix}"
+                shutil.copyfile(src, dest)
+
+            if not _looks_like_image(dest):
+                dest.unlink(missing_ok=True)
+                raise HTTPException(400, f"not a readable image: {item}")
+            names.append(dest.name)
+        return names
+
+    def _resolve_image_ref(ref: str) -> str:
+        """Turn an image reference into an absolute path under the image dir."""
+        name = _materialize_images([ref])[0]
+        return str(cfg.image_dir / name)
+
+    def _openai_messages(
+        messages: list["OpenAIMessage"],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Convert OpenAI-style messages, keeping any images they carry.
+
+        A content array may hold image_url parts; those become `{"type":
+        "image"}` markers on the turn they arrived with, which is how mlx-vlm
+        attributes each image to the right message.
+        """
+        out: list[dict[str, Any]] = []
+        paths: list[str] = []
+        for m in messages:
+            if isinstance(m.content, str):
+                out.append({"role": m.role, "content": m.content})
+                continue
+            if not isinstance(m.content, list):
+                out.append({"role": m.role, "content": str(m.content)})
+                continue
+
+            parts: list[dict[str, Any]] = []
+            texts: list[str] = []
+            for item in m.content:
+                if not isinstance(item, dict):
+                    texts.append(str(item))
+                    continue
+                kind = item.get("type")
+                if kind in ("text", "input_text"):
+                    texts.append(item.get("text") or item.get("content") or "")
+                elif kind in ("image_url", "input_image", "image"):
+                    url = item.get("image_url") or item.get("image") or item.get("url")
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if not url:
+                        continue
+                    name = _materialize_images([url])[0]
+                    paths.append(str(cfg.image_dir / name))
+                    parts.append({"type": "image"})
+            parts.append({"type": "text", "text": " ".join(t for t in texts if t).strip()})
+            out.append({"role": m.role, "content": parts if len(parts) > 1 else parts[0]["text"]})
+        return out, paths
+
+    def _latest_image(thread_id: str) -> str | None:
+        """Newest image in a thread, generated or attached."""
+        for m in reversed(store.get_messages(thread_id)):
+            if m.image and (cfg.image_dir / m.image).exists():
+                return m.image
+            for name in reversed((m.meta or {}).get("images", []) or []):
+                if (cfg.image_dir / name).exists():
+                    return name
+        return None
 
     def _autotitle(thread_id: str, first_message: str) -> None:
         thread = store.get_thread(thread_id)
@@ -209,6 +357,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
 
     def _image_stream(req: ImageRequest, thread_id: str | None) -> Iterator[str]:
         """Shared by POST /api/images and the `/image ...` chat shortcut."""
+        init_image = _resolve_image_ref(req.init_image) if req.init_image else None
         job = manager.submit_image(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
@@ -217,6 +366,8 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
             steps=req.steps,
             guidance=req.guidance,
             seed=req.seed,
+            init_image=init_image,
+            image_strength=req.image_strength,
         )
         for event in job.events():
             if event.get("type") == "done":
@@ -238,27 +389,47 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         if not text and not body.images:
             raise HTTPException(400, "empty message")
 
-        # A leading `/image` turns the single chat box into an image request.
-        # Doing this server-side means the CLI and the web UI behave the same.
-        if text.lower().startswith(IMAGE_PREFIX.strip()) and (
-            text.lower().startswith(IMAGE_PREFIX) or text.strip().lower() == "/image"
-        ):
-            prompt = text[len(IMAGE_PREFIX):].strip() if len(text) > len(IMAGE_PREFIX) else ""
+        # A leading `/image` or `/edit` turns the single chat box into an image
+        # request. Doing this server-side means both frontends behave the same.
+        verb, _, rest = text.partition(" ")
+        verb = verb.lower()
+        if verb in ("/image", "/edit"):
+            prompt = rest.strip()
             if not prompt:
-                raise HTTPException(400, "usage: /image <prompt>")
+                raise HTTPException(400, f"usage: {verb} <prompt>")
+
+            init_image = None
+            if verb == "/edit":
+                # Edit whatever was just attached, else the newest image in the
+                # thread - which is what "make the sky stormier" ought to mean.
+                init_image = (
+                    _materialize_images(body.images)[0] if body.images
+                    else _latest_image(thread.id)
+                )
+                if init_image is None:
+                    raise HTTPException(
+                        400, "/edit needs an image: attach one, or generate one first"
+                    )
+
             store.add_message(thread.id, "user", text)
             _autotitle(thread.id, prompt)
             return StreamingResponse(
-                iterate_in_threadpool(_image_stream(ImageRequest(prompt=prompt), thread.id)),
+                iterate_in_threadpool(_image_stream(
+                    ImageRequest(prompt=prompt, init_image=init_image), thread.id
+                )),
                 media_type="text/event-stream",
             )
 
-        image_paths = _materialize_images(body.images)
-        stored_image = Path(image_paths[0]).name if image_paths else None
-        store.add_message(thread.id, "user", text, image=stored_image)
-        _autotitle(thread.id, text)
+        attachments = _materialize_images(body.images)
+        store.add_message(
+            thread.id, "user", text,
+            meta={"images": attachments} if attachments else None,
+        )
+        _autotitle(thread.id, text or "image")
 
-        history = _history_for_model(thread.id)
+        # History is rebuilt after storing, so this turn's attachments are
+        # included and the marker order matches the paths exactly.
+        history, image_paths = _history_for_model(thread.id)
         job = manager.submit_text(
             messages=history,
             images=image_paths,
@@ -331,7 +502,8 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         thread_id = None
         if body.thread_id:
             thread_id = _resolve(body.thread_id).id
-            store.add_message(thread_id, "user", f"/image {body.prompt}")
+            verb = "/edit" if body.init_image else "/image"
+            store.add_message(thread_id, "user", f"{verb} {body.prompt}")
             _autotitle(thread_id, body.prompt)
         return StreamingResponse(
             iterate_in_threadpool(_image_stream(body, thread_id)),
@@ -361,12 +533,10 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def openai_chat(body: OpenAIChatRequest):
         """Enough of the OpenAI shape to point other local tools at this box."""
-        messages = [
-            {"role": m.role, "content": m.content if isinstance(m.content, str) else str(m.content)}
-            for m in body.messages
-        ]
+        messages, oai_images = _openai_messages(body.messages)
         job = manager.submit_text(
-            messages=messages, max_tokens=body.max_tokens, temperature=body.temperature
+            messages=messages, images=oai_images,
+            max_tokens=body.max_tokens, temperature=body.temperature,
         )
         created = int(time.time())
         cid = f"chatcmpl-{created}"

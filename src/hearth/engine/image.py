@@ -32,6 +32,16 @@ class _StepReporter:
         self.emit({"type": "progress", "step": min(int(t) + 1, self.total), "total": self.total})
 
 
+def _image_size(path: str) -> tuple[int, int]:
+    """Pixel dimensions of a base image, rounded to the multiple of 16 that
+    mflux's latent grid requires."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        w, h = im.size
+    return max(16, (w // 16) * 16), max(16, (h // 16) * 16)
+
+
 class ImageEngine:
     name = "image"
 
@@ -77,6 +87,8 @@ class ImageEngine:
         steps: int | None = None,
         guidance: float | None = None,
         seed: int | None = None,
+        init_image: str | None = None,
+        image_strength: float | None = None,
         cancel: threading.Event | None = None,
         emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> Iterator[dict[str, Any]]:
@@ -95,11 +107,21 @@ class ImageEngine:
         self.last_used = time.time()
 
         steps = steps or self.cfg.steps
-        width = width or self.cfg.width
-        height = height or self.cfg.height
         guidance = guidance if guidance is not None else self.cfg.guidance
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
+
+        if init_image is not None:
+            # Working from a base image: match its shape unless told otherwise,
+            # so the result is a variation rather than a reframing.
+            if width is None or height is None:
+                src_w, src_h = _image_size(init_image)
+                width = width or src_w
+                height = height or src_h
+            if image_strength is None:
+                image_strength = self.cfg.image_strength
+        width = width or self.cfg.width
+        height = height or self.cfg.height
 
         sink = emit if emit is not None else (lambda _event: None)
         reporter = _StepReporter(steps, sink, cancel)
@@ -115,6 +137,8 @@ class ImageEngine:
                 height=height,
                 guidance=guidance,
                 num_inference_steps=steps,
+                image_path=init_image,
+                image_strength=image_strength,
             )
         except StopImageGenerationException:
             yield {"type": "cancelled"}
@@ -149,5 +173,7 @@ class ImageEngine:
                 "height": height,
                 "guidance": guidance,
                 "elapsed_s": round(time.time() - started, 2),
+                **({"image_strength": image_strength, "from_image": Path(init_image).name}
+                   if init_image else {}),
             },
         }
