@@ -131,6 +131,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
     def status() -> dict[str, Any]:
         st = manager.status()
         st["threads"] = len(store.list_threads(limit=1000))
+        st["images"] = config_mod.image_store_stats(cfg)
         st["version"] = "0.1.0"
         return st
 

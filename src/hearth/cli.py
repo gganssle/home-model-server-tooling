@@ -45,6 +45,33 @@ def fail(message: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def tilde(path: Path) -> str:
+    """Shorten a path under $HOME to ~/..., which keeps it on one line."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
+def image_store_summary(stats: dict[str, Any]) -> str:
+    """One line describing the image folder, from the server's own report."""
+    where = tilde(Path(stats["dir"]))
+    if stats.get("files") is None:
+        return f"{where} (unreadable)"
+    if not stats["files"]:
+        return f"{where} (empty)"
+    return f"{where} ({stats['files']} files, {human_size(stats['bytes'])})"
+
+
 def human_age(ts: float) -> str:
     delta = time.time() - ts
     for limit, unit, div in ((60, "s", 1), (3600, "m", 60), (86400, "h", 3600)):
@@ -243,6 +270,15 @@ def serve(
     err.print(f"[green]hearth[/green] serving on http://{cfg.server.host}:{cfg.server.port}")
     err.print(f"[dim]text : {cfg.text.repo}[/dim]")
     err.print(f"[dim]image: {cfg.image.repo}[/dim]")
+    # soft_wrap keeps a long path on one line instead of breaking it mid-path.
+    err.print(
+        f"[dim]images: {image_store_summary(config_mod.image_store_stats(cfg))}[/dim]",
+        soft_wrap=True,
+    )
+    err.print("[dim]        kept indefinitely - nothing is deleted, even when a "
+              "conversation is[/dim]", soft_wrap=True)
+    err.print("[dim]        removed, so tidy this folder by hand when it gets "
+              "large[/dim]", soft_wrap=True)
     uvicorn.run(application, host=cfg.server.host, port=cfg.server.port, log_level="warning")
 
 
@@ -510,6 +546,8 @@ def status() -> None:
     table.add_row("busy", st["busy_with"] or "[dim]idle[/dim]")
     table.add_row("queued", str(st["queue_depth"]))
     table.add_row("threads", str(st.get("threads", 0)))
+    if st.get("images"):
+        table.add_row("images", image_store_summary(st["images"]))
     console.print(table)
 
 

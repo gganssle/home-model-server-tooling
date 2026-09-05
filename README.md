@@ -278,11 +278,31 @@ there is no authentication, so only do that on a network you trust.
 ## Data
 
 ```
-~/.config/hearth/config.toml     configuration
-~/.local/share/hearth/hearth.db  conversations (SQLite)
-~/.local/share/hearth/images/    generated images
+~/.config/hearth/config.toml       configuration
+~/.local/share/hearth/hearth.db    conversations (SQLite)
+~/.local/share/hearth/images/      generated images and attachments
 ~/.local/share/hearth/cli_history  REPL history
 ```
+
+### Images are kept, not reclaimed
+
+Nothing in hearth ever deletes an image. Deleting a conversation removes its
+messages from the database but leaves its images on disk, so the folder only
+grows — a 1024x1024 PNG is roughly 1-2 MB, and attaching the same file twice
+stores it twice.
+
+This is deliberate: images are cheap to keep and annoying to lose, so tidying
+is left to you. Both `hearth serve` and `hearth status` print the folder with a
+current file count and size, so you can see when it is worth a look:
+
+```
+images: ~/.local/share/hearth/images (4 files, 5.5 MB)
+        kept indefinitely - nothing is deleted, even when a conversation is
+        removed, so tidy this folder by hand when it gets large
+```
+
+`hearth status` reports the *server's* folder, so the figure is right even when
+the CLI is pointed at another machine.
 
 ## Tests
 

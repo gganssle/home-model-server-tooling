@@ -5,6 +5,7 @@ daemon that holds the models.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -175,6 +176,14 @@ def main() -> int:
         r = run("search", "hello")
         check("search finds the message", "hello" in r.stdout, repr(r.stdout[:200]))
 
+        print("\nimage folder is surfaced")
+        r = run("status")
+        payload = json.loads(r.stdout)
+        check("status reports the image folder", "images" in payload, r.stdout[:200])
+        check("it names the server's directory",
+              payload["images"]["dir"] == str(Path(ENV["HEARTH_DATA_DIR"]) / "images"),
+              str(payload.get("images")))
+
         print("\nunload")
         r = run("unload", "all")
         check("unload runs", r.returncode == 0, r.stderr[:200])
@@ -199,6 +208,37 @@ def main() -> int:
         check("image documents --strength", "--strength" in r2.stdout, r2.stdout[:400])
         for cmd in ("chat", "ask", "image", "threads", "serve", "pull", "status"):
             check(f"help lists {cmd}", cmd in r.stdout, r.stdout[:400])
+
+        print("\nserve announces where images are kept")
+        banner_env = {**ENV, "HEARTH_PORT": str(free_port())}
+        proc = subprocess.Popen(
+            [str(HEARTH), "serve"], env=banner_env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            # The folder line is followed by two explanatory lines, so keep
+            # reading a little past the match rather than stopping on it.
+            banner = ""
+            deadline = time.time() + 90
+            trailing = 0
+            while time.time() < deadline and trailing < 3:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                banner += line
+                if "images:" in banner:
+                    trailing += 1
+            check("startup names the image folder", "images:" in banner, repr(banner[:400]))
+            check("startup says they are never deleted",
+                  "kept indefinitely" in banner, repr(banner[:400]))
+            check("startup shows the count", "files," in banner or "empty" in banner,
+                  repr(banner[:400]))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     finally:
         server.terminate()

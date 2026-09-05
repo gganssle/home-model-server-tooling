@@ -256,6 +256,18 @@ check("openai text-only still works",
           "model": "x", "messages": [{"role": "user", "content": "hi"}]},
       ).json()["choices"][0]["message"]["content"])
 
+print("\nimage store is reported")
+st = client.get("/api/status").json()
+check("status reports the image folder", "images" in st and "dir" in st["images"],
+      str(st.get("images")))
+check("the reported folder is the one images are served from",
+      st["images"]["dir"] == str(cfg.image_dir), str(st.get("images")))
+check("file count is reported", isinstance(st["images"]["files"], int),
+      str(st.get("images")))
+check("size is reported", isinstance(st["images"]["bytes"], int), str(st.get("images")))
+check("the count reflects images actually written", st["images"]["files"] > 0,
+      str(st.get("images")))
+
 print("\nstrict request fields")
 check("unknown chat field is rejected",
       client.post(f"/api/threads/{tid}/messages",

@@ -130,6 +130,25 @@ def load() -> Config:
     return cfg
 
 
+def image_store_stats(cfg: Config) -> dict[str, Any]:
+    """Where images live and how much is there.
+
+    Nothing ever removes these files - not even deleting the thread they belong
+    to - so this is what tells you when a manual tidy is due. The server reports
+    it so a remote CLI describes the server's directory, not its own.
+    """
+    directory = cfg.image_dir
+    try:
+        files = [f for f in directory.iterdir() if f.is_file()]
+    except OSError:
+        return {"dir": str(directory), "files": None, "bytes": None}
+    return {
+        "dir": str(directory),
+        "files": len(files),
+        "bytes": sum(f.stat().st_size for f in files),
+    }
+
+
 def write_default(force: bool = False) -> Path:
     """Materialize a commented default config file."""
     if CONFIG_PATH.exists() and not force:
