@@ -111,11 +111,13 @@ class HearthClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         images: list[str] | None = None,
+        search: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         body: dict[str, Any] = {"content": content}
         for key, value in (
             ("thinking", thinking), ("max_tokens", max_tokens),
             ("temperature", temperature), ("images", images),
+            ("search", search),
         ):
             if value is not None:
                 body[key] = value

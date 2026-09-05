@@ -19,7 +19,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_web import FixtureWeb  # noqa: E402
 from helpers import free_port  # noqa: E402
+
+WEB = FixtureWeb()
 
 ROOT = Path(__file__).resolve().parents[1]
 HEARTH = ROOT / ".venv" / "bin" / "hearth"
@@ -34,6 +37,10 @@ ENV = {
     "HEARTH_PORT": PORT,
     "HEARTH_HOST": "127.0.0.1",
     "PYTHONPATH": str(ROOT / "tests"),
+    "HEARTH_SEARCH": "1",
+    "HEARTH_SEARCH_PROVIDER": "searxng",
+    "HEARTH_SEARXNG_URL": WEB.base,
+    "HEARTH_SEARCH_ALLOW_PRIVATE": "1",
     "TERM": "dumb",
     "COLUMNS": "100",
     "LINES": "40",
@@ -103,6 +110,10 @@ class Repl:
 
 
 def main() -> int:
+    WEB.__enter__()
+    WEB.set_results([
+        {"url": WEB.url("/article"), "title": "MLX notes", "content": "release notes"},
+    ])
     server = subprocess.Popen(
         [str(PYTHON), str(ROOT / "tests" / "stub_server.py")],
         env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
@@ -217,6 +228,45 @@ def main() -> int:
         repl.send("/switch last")
         check("/switch moves threads", repl.read_until("switched to"), repr(repl.buf[-200:]))
 
+        print("\nweb search")
+        repl.buf = ""
+        repl.send("/web")
+        check("bare /web reports the current state",
+              repl.read_until("web search:"), repr(repl.buf[-300:]))
+        check("bare /web explains both forms",
+              repl.read_until("/web <query>"), repr(repl.buf[-300:]))
+
+        repl.buf = ""
+        repl.send("/web what changed in mlx")
+        check("/web narrates the search",
+              repl.read_until("searching the web"), repr(repl.buf[-400:]))
+        check("/web lists the sources", repl.read_until("MLX release notes"),
+              repr(repl.buf[-600:]))
+        check("/web answers from the sources",
+              repl.read_until("source block(s)"), repr(repl.buf[-600:]))
+
+        repl.buf = ""
+        repl.send("/web on")
+        check("/web on is acknowledged",
+              repl.read_until("on for every message"), repr(repl.buf[-200:]))
+        repl.buf = ""
+        repl.send("anything at all")
+        check("with /web on an ordinary message searches",
+              repl.read_until("searching the web"), repr(repl.buf[-400:]))
+
+        repl.buf = ""
+        repl.send("/web off")
+        check("/web off is acknowledged", repl.read_until("web search off"),
+              repr(repl.buf[-200:]))
+        repl.buf = ""
+        repl.send("and now something else")
+        repl.read_until("tok/s")
+        # The reply still mentions a source block: the previous search's
+        # documents are carried forward by max_history_documents. What must not
+        # happen is a *new* lookup.
+        check("with /web off an ordinary message does not search",
+              "searching the web" not in repl.buf, repr(repl.buf[-400:]))
+
         repl.buf = ""
         repl.send("/status")
         check("/status reports memory", repl.read_until("memory"), repr(repl.buf[-300:]))
@@ -259,6 +309,7 @@ def main() -> int:
         repl = None
 
     finally:
+        WEB.__exit__(None, None, None)
         if repl is not None:
             repl.close()
         server.terminate()

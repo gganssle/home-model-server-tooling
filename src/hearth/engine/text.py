@@ -58,16 +58,26 @@ class TextEngine:
             mx.clear_cache()
 
     def _build_prompt(
-        self, messages: list[dict[str, Any]], images: list[str], thinking: bool
+        self,
+        messages: list[dict[str, Any]],
+        images: list[str],
+        thinking: bool,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         """Render chat messages with the model's own chat template.
 
         `enable_thinking` has to go to the template as well as the generator:
         the template decides whether the turn pre-opens a <think> block, and
         mlx-vlm defaults it to False when it is not passed.
+
+        `tools` is forwarded the same way. mlx-vlm passes unrecognised kwargs
+        straight through to the tokenizer's own template, so the model renders
+        its native tool syntax rather than us hand-writing a schema into the
+        system prompt and hoping it matches.
         """
         from mlx_vlm import apply_chat_template
 
+        extra: dict[str, Any] = {"tools": tools} if tools else {}
         return apply_chat_template(
             self.processor,
             self.config,
@@ -75,6 +85,7 @@ class TextEngine:
             num_images=len(images),
             add_generation_prompt=True,
             enable_thinking=thinking,
+            **extra,
         )
 
     def stream(
@@ -85,6 +96,7 @@ class TextEngine:
         temperature: float | None = None,
         top_p: float | None = None,
         thinking: bool | None = None,
+        tools: list[dict[str, Any]] | None = None,
         cancel: threading.Event | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield {"type": "token"|"done"} events for one assistant turn."""
@@ -95,7 +107,7 @@ class TextEngine:
         images = images or []
 
         want_thinking = thinking if thinking is not None else self.cfg.enable_thinking
-        prompt = self._build_prompt(messages, images, want_thinking)
+        prompt = self._build_prompt(messages, images, want_thinking, tools)
 
         # With thinking on, the template leaves the prompt ending in "<think>",
         # so generation begins *inside* the reasoning block. With it off the

@@ -117,6 +117,7 @@ keep typing — pick one with the arrow keys or Tab.
 /attach <path>             queue an image for the model to look at
 /detach                    drop queued attachments
 /think on|off              toggle reasoning mode
+/web on|off|<query>        search the web now, or for every message
 /retry                     re-run your last message
 /title <text>              rename this conversation
 /show                      reprint the conversation so far
@@ -185,6 +186,115 @@ attached to the conversation they belong to. Attachments are copied in rather
 than referenced, so a conversation still renders after you move or delete the
 original.
 
+## Web search
+
+Off by default. Turn it on and the assistant can read live pages instead of
+guessing at anything that happened after its training data ends.
+
+### Pointing it at a provider
+
+**SearXNG** is the default, because you can run it yourself and the query never
+leaves your hardware — the same reason the models are local:
+
+```bash
+docker run -d -p 8888:8080 -v "$PWD/searxng:/etc/searxng" searxng/searxng
+```
+
+Add `json` to the `formats` list in its `settings.yml`, or it will serve HTML
+only and hearth will tell you so. Then:
+
+```toml
+[search]
+enabled = true
+provider = "searxng"
+searxng_url = "http://127.0.0.1:8888"
+```
+
+**Brave** works too if you would rather not host anything — set
+`provider = "brave"` and a `brave_api_key` (or `HEARTH_BRAVE_KEY`).
+
+`hearth status` shows which one is live, or why none is.
+
+Page text is extracted with a small stdlib HTML parser. If `trafilatura` is
+installed it is used instead, which is noticeably better at finding the article
+in a page full of furniture:
+
+```bash
+uv pip install -e '.[search]'
+```
+
+### Using it
+
+```bash
+hearth ask --web "what changed in the latest mlx release?"
+hearth ask --no-web "explain unified memory"      # never search this one
+```
+
+In the REPL:
+
+```
+/web what changed in mlx 0.32     search for exactly that, then answer
+/web on                           search on every message from here
+/web off                          stop
+/web                              say which of those is in force
+```
+
+In the browser, tick **Web** in the composer toolbar. It only appears when the
+server actually has a provider.
+
+Sources are listed under the answer, and go to stderr from the CLI so they
+survive a pipe — `--quiet` is what silences them.
+
+### Deciding when to search, without being asked
+
+`search.autonomous` picks the policy:
+
+| | |
+|---|---|
+| `"off"` | search only when explicitly asked. The default. |
+| `"heuristic"` | a cheap pre-filter decides before generating: temporal wording, a recent year, a URL, "look it up". Crude, but it costs nothing and it is inspectable. |
+| `"tool"` | offer the model a `web_search` tool and let it decide. |
+
+`"tool"` is the one everyone expects and the one to be careful with: a ~30B
+local model is materially worse calibrated about *when* to call a tool than a
+frontier model is. Searching when you did not need to is not free — it costs
+seconds, and a mediocre SEO-spam page in the context will happily displace
+knowledge the model already had. Start with `"heuristic"`, which is also the
+baseline `"tool"` has to beat before it is worth the extra generation round.
+
+Either way, tell the model when its knowledge ends:
+
+```toml
+[models.text]
+knowledge_cutoff = "mid 2024"
+```
+
+That, plus today's date, goes into the system prompt. It is the cheapest change
+in the whole feature and does most of the work: it is what lets the model say
+"that is after my time" instead of inventing an answer with the same
+confidence it uses for everything else.
+
+### What it will not do
+
+Fetching refuses anything that is not `http`/`https`, and refuses to resolve to
+a loopback, private, link-local or reserved address — then pins the connection
+to the address it checked, so a second DNS answer cannot redirect it, and
+re-checks every redirect hop. This matters more here than in a hosted product:
+the daemon may be bound to your LAN, and under `autonomous = "tool"` the URL
+originates with the model. Set `allow_private_hosts = true` if you genuinely
+want it reading an intranet wiki.
+
+Retrieved pages arrive wrapped in `<source>` tags with a standing instruction
+that everything inside them is untrusted data and never an instruction, and a
+page cannot close its own wrapper. Treat that as a speed bump rather than a
+guarantee — prompt injection through retrieved content is not a solved problem
+anywhere.
+
+Only the most recent search keeps its full page text in the prompt
+(`max_history_documents`); older ones collapse to a one-line source list. A
+single web page is bigger than most whole conversations, so without that a
+thread runs out of context in about three turns.
+
 ## Reasoning mode
 
 Qwen3.6 is a hybrid reasoning model. Thinking is **off** by default so chat
@@ -213,6 +323,7 @@ max_history_messages = 40
 max_history_images = 4     # attached images carried forward between turns
 enable_thinking = false
 system_prompt = "You are a helpful assistant running locally on the user's own machine."
+knowledge_cutoff = ""      # e.g. "mid 2024"; goes in the prompt beside today's date
 
 [models.image]
 repo = "mlx-community/Qwen-Image-2512-4bit"
@@ -221,6 +332,20 @@ width = 1024
 height = 1024
 guidance = 4.0
 image_strength = 0.6       # default for --from / /edit, 0-1
+
+[search]
+enabled = false            # off until you point it at a provider
+provider = "searxng"       # searxng | brave | none
+searxng_url = "http://127.0.0.1:8888"
+brave_api_key = ""
+max_results = 5            # results asked of the provider
+max_fetch = 3              # of those, how many pages are actually read
+max_context_chars = 6000   # hard ceiling on retrieved text in the prompt
+max_history_documents = 1  # how many past searches keep their full page text
+autonomous = "off"         # off | heuristic | tool
+max_rounds = 2             # cap on model-initiated search rounds per turn
+timeout_s = 10.0
+allow_private_hosts = false  # true to allow an intranet wiki or a LAN SearXNG
 
 [memory]
 idle_evict_seconds = 900   # give memory back after 15 min idle; 0 to never
@@ -320,13 +445,16 @@ the CLI is pointed at another machine.
 ./run_tests.sh
 ```
 
-The suite stubs out the two model engines, so it needs no weights and no GPU:
+The suite stubs out the two model engines, so it needs no weights and no GPU.
+It also never touches the real internet: search is answered by a fake provider
+and a fixture web server on an ephemeral loopback port.
 
 | | |
 |---|---|
-| `test_integration.py` | routing, SSE framing, the reasoning split, thread persistence, path traversal, the OpenAI shim |
+| `test_search.py` | SSRF guards, HTML extraction, the context budget, tool-call parsing, the search heuristic |
+| `test_integration.py` | routing, SSE framing, the reasoning split, thread persistence, path traversal, retrieval end to end, the OpenAI shim |
 | `test_cli.py` | every CLI command against a live server, including pipe behaviour |
-| `test_concurrency.py` | cancellation mid-generation, request queueing, unloading |
+| `test_concurrency.py` | cancellation mid-generation and mid-fetch, request queueing, unloading |
 | `test_repl.py` | the interactive REPL, driven through a real pty |
 | `web/md.test.js` | the UI's markdown renderer and its HTML escaping |
 
@@ -343,7 +471,12 @@ models — text, multi-turn context, reasoning, and image generation:
 src/hearth/
   config.py       TOML + env configuration
   store.py        SQLite threads and messages
-  textutil.py     incremental <think> block splitting
+  textutil.py     incremental <think> and <tool_call> splitting
+  search/
+    providers.py  SearXNG and Brave behind one interface
+    fetch.py      guarded fetch (SSRF) and HTML text extraction
+    budget.py     fitting retrieved pages into the context window
+    heuristics.py deciding whether a message needs the web
   engine/
     manager.py    job queue, lazy loading, idle eviction
     text.py       mlx-vlm text generation

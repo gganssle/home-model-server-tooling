@@ -11,7 +11,9 @@ import base64
 import binascii
 import json
 import logging
+import queue
 import shutil
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,8 +26,10 @@ from starlette.concurrency import iterate_in_threadpool
 
 from hearth import config as config_mod
 from hearth.engine import ModelManager
+from hearth.search import TOOL_SCHEMA, Outcome, WebSearch
+from hearth.search import budget as search_budget
 from hearth.store import Store
-from hearth.textutil import ThinkSplitter
+from hearth.textutil import ThinkSplitter, ToolCallSplitter, tool_call_query
 
 log = logging.getLogger("hearth.server")
 
@@ -77,6 +81,9 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     thinking: bool | None = None
+    # True forces a web search for this turn, False suppresses one that would
+    # otherwise be automatic, None leaves the decision to the configured policy.
+    search: bool | None = None
 
 
 class ImageRequest(BaseModel):
@@ -113,6 +120,12 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
     cfg = cfg or config_mod.load()
     store = Store(cfg.db_path)
     manager = ModelManager(cfg)
+    websearch = WebSearch(cfg.search)
+
+    # Retrieval happens before a job exists, so manager.cancel_current() cannot
+    # reach it. Each in-flight turn parks a flag here for /api/cancel to set.
+    search_cancels: set[threading.Event] = set()
+    search_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -124,6 +137,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
     app.state.cfg = cfg
     app.state.store = store
     app.state.manager = manager
+    app.state.websearch = websearch
 
     # ---------------- meta ----------------
 
@@ -132,12 +146,30 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         st = manager.status()
         st["threads"] = len(store.list_threads(limit=1000))
         st["images"] = config_mod.image_store_stats(cfg)
+        st["search"] = {
+            "enabled": websearch.enabled,
+            "provider": cfg.search.provider if websearch.enabled else None,
+            "autonomous": cfg.search.autonomous,
+            "reason": None if websearch.enabled else websearch.unavailable_reason,
+        }
         st["version"] = "0.1.0"
         return st
 
     @app.post("/api/cancel")
     def cancel() -> dict[str, Any]:
-        return {"cancelled": manager.cancel_current()}
+        """Stop whatever this server is doing for someone right now.
+
+        That is two different things: a running generation, which the manager
+        owns, and a retrieval, which happens in the request path before any job
+        exists. Cancelling only the first leaves the user watching a fetch they
+        already asked to stop.
+        """
+        with search_lock:
+            pending = list(search_cancels)
+        for flag in pending:
+            flag.set()
+        stopped_job = manager.cancel_current()
+        return {"cancelled": stopped_job or bool(pending), "searches": len(pending)}
 
     @app.post("/api/models/{which}/preload")
     def preload(which: str) -> dict[str, Any]:
@@ -211,22 +243,54 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         msgs = store.get_messages(thread_id, limit=cfg.text.max_history_messages)
 
         # Walk backwards to decide which attachments still fit the budget.
-        budget = max(0, cfg.text.max_history_images)
+        image_budget = max(0, cfg.text.max_history_images)
         keep: set[str] = set()
         for m in reversed(msgs):
             if m.role != "user":
                 continue
             for name in reversed((m.meta or {}).get("images", []) or []):
-                if len(keep) >= budget:
+                if len(keep) >= image_budget:
                     break
                 keep.add(name)
 
+        # The same walk, for retrieved pages. One search is bigger than the
+        # rest of a thread put together, so only the newest few keep their full
+        # text; everything older collapses to the one-line source list that is
+        # already stored as the message's content.
+        doc_budget = max(0, cfg.search.max_history_documents)
+        verbatim: set[str] = set()
+        for m in reversed(msgs):
+            if m.role != "tool" or not (m.meta or {}).get("search"):
+                continue
+            if len(verbatim) >= doc_budget:
+                break
+            verbatim.add(m.id)
+
         out: list[dict[str, Any]] = []
         paths: list[str] = []
-        if cfg.text.system_prompt:
-            out.append({"role": "system", "content": cfg.text.system_prompt})
+        preamble = config_mod.system_prompt(cfg)
+        if preamble:
+            out.append({"role": "system", "content": preamble})
 
         for m in msgs:
+            if m.role == "tool":
+                record = (m.meta or {}).get("search") or {}
+                block = ""
+                if m.id in verbatim:
+                    block = search_budget.pack(
+                        record.get("documents") or [],
+                        cfg.search.max_context_chars,
+                        record.get("query", ""),
+                    )
+                # Retrieved text is projected onto the user role rather than
+                # sent as role="tool". A bare tool message with no matching
+                # tool_call ahead of it is not a shape every chat template
+                # handles, and when a template mishandles it the result is a
+                # quietly malformed prompt rather than an error. The store keeps
+                # the honest role - only what the model sees is flattened.
+                out.append({"role": "user", "content": block or m.content})
+                continue
+
             content: Any = m.content
             if m.image and m.role == "assistant":
                 prompt = (m.meta or {}).get("prompt", "")
@@ -350,6 +414,55 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     return name
         return None
 
+    def _run_search(
+        thread_id: str, query: str, cancel: threading.Event, reason: str | None = None
+    ):
+        """Retrieve, streaming progress, and record the result on the thread.
+
+        This runs on the threadpool thread that is producing the response body,
+        so the network wait is off the event loop and - the part that matters -
+        off the manager's worker thread, which must only ever be doing GPU work.
+
+        The retrieval itself goes on a side thread so its phase events can be
+        streamed as they happen rather than arriving in a lump at the end;
+        exactly the shape Job already uses for the engines. Returns the Outcome
+        via `yield from`.
+        """
+        events: queue.Queue = queue.Queue()
+        box: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                box["outcome"] = websearch.run(
+                    query, emit=events.put, cancel=cancel, reason=reason
+                )
+            except Exception as exc:
+                log.exception("web search crashed")
+                box["crashed"] = True
+                box["outcome"] = Outcome(query=query, error=f"{type(exc).__name__}: {exc}")
+            finally:
+                events.put(None)
+
+        worker = threading.Thread(target=work, name="hearth-search", daemon=True)
+        worker.start()
+        while True:
+            event = events.get()
+            if event is None:
+                break
+            yield sse(event)
+        worker.join()
+
+        outcome: Outcome = box["outcome"]
+        if box.get("crashed"):
+            yield sse({"type": "search", "phase": "error", "error": outcome.error})
+
+        # Stored even when it failed or was cancelled: the transcript should say
+        # that a lookup was attempted, and the compact line is what says it.
+        store.add_message(
+            thread_id, "tool", outcome.compact(), meta={"search": outcome.to_meta()}
+        )
+        return outcome
+
     def _autotitle(thread_id: str, first_message: str) -> None:
         thread = store.get_thread(thread_id)
         if thread and thread.title in ("New conversation", "", None):
@@ -421,27 +534,52 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                 media_type="text/event-stream",
             )
 
+        # `/web <query>` searches before answering. Routed on the leading verb
+        # like /image and /edit, so both frontends behave identically without
+        # either of them implementing it.
+        forced_query: str | None = None
+        if verb == "/web":
+            forced_query = rest.strip()
+            if not forced_query:
+                raise HTTPException(400, "usage: /web <query>")
+
         attachments = _materialize_images(body.images)
         store.add_message(
             thread.id, "user", text,
             meta={"images": attachments} if attachments else None,
         )
-        _autotitle(thread.id, text or "image")
+        _autotitle(thread.id, forced_query or text or "image")
 
-        # History is rebuilt after storing, so this turn's attachments are
-        # included and the marker order matches the paths exactly.
-        history, image_paths = _history_for_model(thread.id)
-        job = manager.submit_text(
-            messages=history,
-            images=image_paths,
-            max_tokens=body.max_tokens,
-            temperature=body.temperature,
-            thinking=body.thinking,
+        # Three ways a turn can end up searching, in descending order of how
+        # much the user meant it.
+        if body.search is False:
+            want_search, search_why = False, "suppressed for this message"
+        elif forced_query is not None or body.search:
+            want_search, search_why = True, "requested"
+        else:
+            want_search, search_why = websearch.wants_search(text)
+
+        # Without an explicit query, the message itself is the query. No model
+        # call rewrites it - that would cost a whole extra generation - so a
+        # turn that leans on earlier context ("what about the second one?")
+        # searches badly. `/web` exists for exactly that case.
+        search_text = forced_query or text
+
+        offer_tools = (
+            websearch.enabled
+            and cfg.search.autonomous == "tool"
+            and body.search is not False
         )
 
         def gen() -> Iterator[str]:
-            splitter = ThinkSplitter()
+            cancel = threading.Event()
+            with search_lock:
+                search_cancels.add(cancel)
+
             saved = False
+            answer: list[str] = []
+            reasoning: list[str] = []
+            sources: list[dict[str, Any]] = []
 
             def persist(meta: dict[str, Any], cancelled: bool) -> Iterator[str]:
                 """Write the assistant turn exactly once, however the stream ended.
@@ -453,14 +591,14 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                 if saved:
                     return
                 saved = True
-                for channel, piece in splitter.finish():
-                    yield sse({"type": "token", "channel": channel, "text": piece})
                 meta = dict(meta)
-                if splitter.thinking_text:
-                    meta["thinking"] = splitter.thinking_text
+                if reasoning:
+                    meta["thinking"] = "".join(reasoning)
+                if sources:
+                    meta["sources"] = sources
                 if cancelled:
                     meta["cancelled"] = True
-                content = splitter.content_text.strip()
+                content = "".join(answer).strip()
                 msg = store.add_message(thread.id, "assistant", content, meta=meta)
                 yield sse({
                     "type": "done",
@@ -470,27 +608,112 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     "cancelled": cancelled,
                 })
 
-            for event in job.events():
-                etype = event.get("type")
-                if etype == "start":
-                    # Internal: tells us whether the prompt pre-opened <think>.
-                    splitter = ThinkSplitter(start_in_think=event.get("thinking_open", False))
-                elif etype == "token":
-                    for channel, piece in splitter.feed(event["text"]):
-                        yield sse({"type": "token", "channel": channel, "text": piece})
-                elif etype == "done":
-                    yield from persist(event.get("meta") or {}, event.get("cancelled", False))
-                elif etype == "cancelled":
-                    yield sse(event)
-                    yield from persist({}, True)
-                elif etype == "error":
-                    yield sse(event)
-                    yield from persist({"error": event.get("error")}, False)
-                else:
-                    yield sse(event)
+            def emit_token(channel: str, piece: str) -> str:
+                (reasoning if channel == "thinking" else answer).append(piece)
+                return sse({"type": "token", "channel": channel, "text": piece})
 
-            # A stream that ended without any terminal event still gets saved.
-            yield from persist({}, False)
+            try:
+                # ---- retrieval first, before any GPU work is queued ----
+                if want_search and not websearch.enabled:
+                    yield sse({"type": "search", "phase": "error",
+                               "error": websearch.unavailable_reason})
+                elif want_search:
+                    log.info("searching (%s): %s", search_why, search_text)
+                    outcome = yield from _run_search(
+                        thread.id, search_text, cancel, search_why
+                    )
+                    sources.extend(outcome.sources())
+                    if outcome.cancelled or cancel.is_set():
+                        yield sse({"type": "cancelled"})
+                        yield from persist({}, True)
+                        return
+
+                rounds = 0
+                while True:
+                    # History is rebuilt each round, after storing, so this
+                    # turn's attachments and any retrieval just performed are
+                    # both included and the image markers line up with paths.
+                    history, image_paths = _history_for_model(thread.id)
+                    job = manager.submit_text(
+                        messages=history,
+                        images=image_paths,
+                        max_tokens=body.max_tokens,
+                        temperature=body.temperature,
+                        thinking=body.thinking,
+                        tools=[TOOL_SCHEMA] if offer_tools else None,
+                    )
+
+                    think = ThinkSplitter()
+                    # Reasoning is separated first; only the content channel is
+                    # scanned for tool calls, so a <tool_call> the model muses
+                    # about inside <think> is not mistaken for a real one.
+                    calls = ToolCallSplitter(enabled=offer_tools)
+                    terminal: dict[str, Any] = {}
+
+                    for event in job.events():
+                        etype = event.get("type")
+                        if etype == "start":
+                            think = ThinkSplitter(
+                                start_in_think=event.get("thinking_open", False)
+                            )
+                        elif etype == "token":
+                            for channel, piece in think.feed(event["text"]):
+                                if channel == "thinking":
+                                    yield emit_token("thinking", piece)
+                                else:
+                                    for visible in calls.feed(piece):
+                                        yield emit_token("content", visible)
+                        elif etype in ("done", "cancelled", "error"):
+                            terminal = event
+                            if etype != "done":
+                                yield sse(event)
+                        else:
+                            yield sse(event)
+
+                    for channel, piece in think.finish():
+                        if channel == "thinking":
+                            yield emit_token("thinking", piece)
+                        else:
+                            for visible in calls.feed(piece):
+                                yield emit_token("content", visible)
+                    for visible in calls.finish():
+                        yield emit_token("content", visible)
+
+                    cancelled = bool(terminal.get("cancelled")) or \
+                        terminal.get("type") == "cancelled" or cancel.is_set()
+                    meta = dict(terminal.get("meta") or {})
+                    if terminal.get("type") == "error":
+                        meta["error"] = terminal.get("error")
+
+                    query = next(
+                        (q for call in calls.calls if (q := tool_call_query(call))), None
+                    )
+                    keep_going = (
+                        query
+                        and offer_tools
+                        and not cancelled
+                        and terminal.get("type") != "error"
+                        and rounds < max(0, cfg.search.max_rounds)
+                    )
+                    if keep_going:
+                        # The model's preamble for this round has already been
+                        # streamed but is not written back into history: the
+                        # next round sees the question and the sources, which is
+                        # the context that actually helps it answer.
+                        rounds += 1
+                        outcome = yield from _run_search(
+                            thread.id, query, cancel, "the model asked"
+                        )
+                        sources.extend(outcome.sources())
+                        if not (outcome.cancelled or cancel.is_set()):
+                            continue
+                        cancelled = True
+
+                    yield from persist(meta, cancelled)
+                    return
+            finally:
+                with search_lock:
+                    search_cancels.discard(cancel)
 
         return StreamingResponse(
             iterate_in_threadpool(gen()), media_type="text/event-stream"

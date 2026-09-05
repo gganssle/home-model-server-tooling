@@ -1,4 +1,4 @@
-const { md, esc } = require('./md.js');
+const { md, esc, safeHref } = require('./md.js');
 let pass = 0, fail = 0;
 function t(name, got, want) {
   if (got === want) { console.log('  ok   ' + name); pass++; }
@@ -42,6 +42,15 @@ hasnt('javascript: urls are not linkified', md('[x](javascript:alert(1))'), '<a 
 has('headings', md('## Title'), '<h2>Title</h2>');
 has('bullets', md('- one\n- two'), '<li>one</li>');
 has('numbered lists', md('1. one\n2. two'), '<li>one</li>');
+
+console.log('\nsource links');
+t('http passes through', safeHref('http://e.com/a'), 'http://e.com/a');
+t('https passes through', safeHref('https://e.com/a'), 'https://e.com/a');
+t('javascript: is defused', safeHref('javascript:alert(1)'), '#');
+t('data: is defused', safeHref('data:text/html,<script>'), '#');
+t('a scheme-relative url is defused', safeHref('//evil.example'), '#');
+t('nothing at all is defused', safeHref(''), '#');
+t('undefined is defused', safeHref(undefined), '#');
 
 console.log('\nparagraphs');
 has('paragraphs split on blank lines', md('a\n\nb'), '<p>a</p>');

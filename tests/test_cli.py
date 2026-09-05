@@ -15,7 +15,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_web import FixtureWeb  # noqa: E402
 from helpers import free_port  # noqa: E402
+
+# A fake web in this process; the stub server reaches it over loopback.
+WEB = FixtureWeb()
 
 ROOT = Path(__file__).resolve().parents[1]
 HEARTH = ROOT / ".venv" / "bin" / "hearth"
@@ -30,6 +34,10 @@ ENV = {
     "HEARTH_PORT": PORT,
     "HEARTH_HOST": "127.0.0.1",
     "PYTHONPATH": str(ROOT / "tests"),
+    "HEARTH_SEARCH": "1",
+    "HEARTH_SEARCH_PROVIDER": "searxng",
+    "HEARTH_SEARXNG_URL": WEB.base,
+    "HEARTH_SEARCH_ALLOW_PRIVATE": "1",
     "NO_COLOR": "1",
 }
 
@@ -64,6 +72,10 @@ def main() -> int:
           repr((r.stderr + r.stdout)[:160]))
 
     print("\nstarting stub server")
+    WEB.__enter__()
+    WEB.set_results([
+        {"url": WEB.url("/article"), "title": "MLX notes", "content": "release notes"},
+    ])
     server = subprocess.Popen(
         [str(PYTHON), str(ROOT / "tests" / "stub_server.py")],
         env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
@@ -85,6 +97,30 @@ def main() -> int:
         print("\nstatus")
         r = run("status")
         check("status emits json when piped", '"memory"' in r.stdout, r.stdout[:160])
+        check("status reports the search provider", '"searxng"' in r.stdout, r.stdout[:400])
+
+        print("\nweb search")
+        r = run("ask", "--web", "what changed in mlx")
+        check("--web puts the answer on stdout",
+              "source block(s)" in r.stdout, repr(r.stdout[:200]))
+        check("--web keeps the sources off stdout",
+              "http" not in r.stdout, repr(r.stdout[:200]))
+        check("--web narrates on stderr",
+              "searching the web" in r.stderr, repr(r.stderr[:300]))
+        check("--web lists its sources on stderr",
+              "/article" in r.stderr, repr(r.stderr[:400]))
+        check("the page's own title wins over the provider's",
+              "MLX release notes" in r.stderr, repr(r.stderr[:400]))
+        r = run("ask", "--web", "--quiet", "what changed in mlx")
+        check("--quiet silences the source list", "searching the web" not in r.stderr,
+              repr(r.stderr[:200]))
+        check("--quiet still answers", "source block(s)" in r.stdout, repr(r.stdout[:200]))
+        r = run("ask", "--no-web", "what is the latest mlx")
+        check("--no-web answers from memory",
+              "you said:" in r.stdout, repr(r.stdout[:200]))
+        check("--no-web does not search", "searching the web" not in r.stderr)
+        r = run("ask", "--help")
+        check("ask documents --web", "--web" in r.stdout, r.stdout[:600])
 
         print("\nask")
         r = run("ask", "hello there")
@@ -247,6 +283,7 @@ def main() -> int:
                 proc.kill()
 
     finally:
+        WEB.__exit__(None, None, None)
         server.terminate()
         try:
             server.wait(timeout=10)
