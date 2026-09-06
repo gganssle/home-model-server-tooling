@@ -4,7 +4,8 @@ set -u
 cd "$(dirname "$0")"
 PY=./.venv/bin/python
 fail=0
-for t in tests/test_integration.py tests/test_cli.py tests/test_concurrency.py tests/test_repl.py; do
+for t in tests/test_search.py tests/test_integration.py tests/test_cli.py \
+         tests/test_concurrency.py tests/test_repl.py; do
   echo "=============================================="
   echo "  $t"
   echo "=============================================="

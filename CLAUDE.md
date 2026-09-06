@@ -85,7 +85,8 @@ in the browser be continued from the terminal.
 src/hearth/
   config.py       TOML + HEARTH_* env configuration
   store.py        SQLite threads and messages
-  textutil.py     incremental <think> block splitting
+  textutil.py     incremental <think> and <tool_call> splitting
+  search/         web retrieval; a sibling of engine/ because it touches no model
   engine/
     manager.py    job queue, lazy loading, idle eviction
     text.py       mlx-vlm text generation
@@ -101,6 +102,13 @@ src/hearth/
 **All GPU work runs on one worker thread** (`engine/manager.py`). MLX is not
 safe to run concurrently and two large models racing for unified memory will
 wedge the machine, so requests queue rather than collide.
+
+**Retrieval never runs on the worker thread.** `src/hearth/search/` is a
+sibling of `engine/`, not a part of it, for this reason: the worker thread is
+effectively the GPU lock, and a ten second fetch taken on it stalls every
+queued generation behind it. Web search runs in the server's request path,
+inside the streaming response (so it is off the event loop too), and a turn
+that searches becomes two model jobs with an HTTP round trip in between.
 
 **mflux must generate on the thread that loaded it.** MLX streams are
 per-thread; running the denoise loop on a different thread fails with

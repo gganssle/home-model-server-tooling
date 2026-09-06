@@ -318,6 +318,207 @@ check("web UI served", client.get("/").status_code == 200 and "hearth" in client
 check("thread deleted", client.delete(f"/api/threads/{tid}").status_code == 200)
 check("deleted thread gone", client.get(f"/api/threads/{tid}").status_code == 404)
 
+# --------------------------------------------------------------------------
+# Web search. A second app, because search config is read when the app is
+# built. The provider is faked and every URL points at the fixture server, so
+# none of this touches the real internet.
+print("\nweb search")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_web import FakeProvider, FixtureWeb  # noqa: E402
+
+web = FixtureWeb()
+web.__enter__()
+try:
+    scfg = config_mod.load()
+    scfg.search.enabled = True
+    scfg.search.provider = "searxng"
+    scfg.search.searxng_url = web.base
+    scfg.search.allow_private_hosts = True
+    scfg.search.max_results = 3
+    scfg.search.max_fetch = 2
+    scfg.search.max_context_chars = 4000
+    scfg.search.max_history_documents = 1
+    scfg.text.knowledge_cutoff = "mid 2024"
+
+    sapp = create_app(scfg)
+    sclient = TestClient(sapp)
+    provider = FakeProvider([
+        {"title": "MLX notes", "url": web.url("/article"), "snippet": "notes"},
+        {"title": "Plain", "url": web.url("/plain"), "snippet": "plain"},
+    ])
+    sapp.state.websearch._provider = provider
+
+    st = sclient.get("/api/status").json()
+    check("status reports search enabled", st["search"]["enabled"] is True, str(st["search"]))
+    check("status names the provider", st["search"]["provider"] == "searxng")
+
+    # ---- the /web verb
+    wt = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    r = sclient.post(f"/api/threads/{wt}/messages", json={"content": "/web mlx 0.32 release"})
+    events = sse_events(r)
+    phases = [e["phase"] for e in events if e["type"] == "search"]
+    check("/web streams search phases",
+          phases == ["querying", "results", "fetching", "ready"], str(phases))
+    check("/web uses the given query", provider.queries[-1] == "mlx 0.32 release",
+          str(provider.queries))
+    ready = next(e for e in events if e.get("phase") == "ready")
+    check("sources are reported to the client", len(ready["sources"]) == 2)
+    check("sources carry a url", ready["sources"][0]["url"].endswith("/article"))
+
+    answer = "".join(e["text"] for e in events
+                     if e["type"] == "token" and e.get("channel") != "thinking")
+    check("the model saw exactly one source block", "from 1 source block(s)" in answer, answer)
+    done = [e for e in events if e["type"] == "done"][0]
+    check("the assistant turn records its sources", len(done["meta"]["sources"]) == 2)
+
+    msgs = sclient.get(f"/api/threads/{wt}").json()["messages"]
+    tool_msgs = [m for m in msgs if m["role"] == "tool"]
+    check("the search is stored as a tool message", len(tool_msgs) == 1)
+    check("the stored content is the compact line",
+          tool_msgs[0]["content"].startswith("[searched the web for"), tool_msgs[0]["content"])
+    check("the compact line stays short", len(tool_msgs[0]["content"]) < 400)
+    check("the full page text is on meta, not content",
+          len(tool_msgs[0]["meta"]["search"]["documents"][0]["text"]) > 100)
+    check("the page text is NOT in content",
+          "unified memory" not in tool_msgs[0]["content"])
+    check("bare /web is rejected",
+          sclient.post(f"/api/threads/{wt}/messages",
+                       json={"content": "/web"}).status_code == 400)
+
+    # ---- a follow-up reuses the stored documents rather than fetching again
+    before = len(provider.queries)
+    r = sclient.post(f"/api/threads/{wt}/messages",
+                     json={"content": "and what about performance?"})
+    events = sse_events(r)
+    answer = "".join(e["text"] for e in events
+                     if e["type"] == "token" and e.get("channel") != "thinking")
+    check("a follow-up triggers no new search", len(provider.queries) == before)
+    check("the follow-up still sees the stored sources",
+          "from 1 source block(s)" in answer, answer)
+
+    # ---- only the newest search keeps its full text
+    sclient.post(f"/api/threads/{wt}/messages", json={"content": "/web something else"})
+    r = sclient.post(f"/api/threads/{wt}/messages", json={"content": "so what now?"})
+    answer = "".join(e["text"] for e in sse_events(r)
+                     if e["type"] == "token" and e.get("channel") != "thinking")
+    check("older searches degrade to their compact line",
+          "from 1 source block(s)" in answer, answer)
+
+    # ---- the explicit per-message flag
+    ft = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    before = len(provider.queries)
+    r = sclient.post(f"/api/threads/{ft}/messages",
+                     json={"content": "tell me about mlx", "search": True})
+    check("search:true searches", len(provider.queries) == before + 1)
+    check("search:true derives the query from the message",
+          provider.queries[-1] == "tell me about mlx", str(provider.queries[-1]))
+    answer = "".join(e["text"] for e in sse_events(r) if e["type"] == "token")
+    check("search:true reaches the model", "source block(s)" in answer)
+
+    before = len(provider.queries)
+    sclient.post(f"/api/threads/{ft}/messages",
+                 json={"content": "just answer from memory", "search": False})
+    check("search:false does not search", len(provider.queries) == before)
+
+    # ---- the heuristic tier
+    scfg.search.autonomous = "heuristic"
+    ht = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    before = len(provider.queries)
+    sclient.post(f"/api/threads/{ht}/messages",
+                 json={"content": "what is the latest version of mlx?"})
+    check("the heuristic fires on time-sensitive wording",
+          len(provider.queries) == before + 1)
+    r = sclient.post(f"/api/threads/{ht}/messages",
+                     json={"content": "what is the current price of an M3 Ultra?"})
+    querying = next(e for e in sse_events(r) if e.get("phase") == "querying")
+    check("the client is told why it searched",
+          "changes over time" in (querying.get("reason") or ""), str(querying))
+
+    before = len(provider.queries)
+    sclient.post(f"/api/threads/{ht}/messages", json={"content": "write me a haiku"})
+    check("the heuristic stays quiet otherwise", len(provider.queries) == before)
+    before = len(provider.queries)
+    sclient.post(f"/api/threads/{ht}/messages",
+                 json={"content": "what is the latest mlx?", "search": False})
+    check("search:false overrides the heuristic", len(provider.queries) == before)
+    scfg.search.autonomous = "off"
+
+    # ---- the model-initiated tier
+    scfg.search.autonomous = "tool"
+    scfg.search.max_rounds = 2
+    tt = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    before = len(provider.queries)
+    r = sclient.post(f"/api/threads/{tt}/messages", json={"content": "LOOKUP mlx please"})
+    events = sse_events(r)
+    answer = "".join(e["text"] for e in events
+                     if e["type"] == "token" and e.get("channel") != "thinking")
+    check("a tool call triggers a search", len(provider.queries) == before + 1)
+    check("the model's own query is used", provider.queries[-1] == "mlx release",
+          str(provider.queries[-1]))
+    check("the tool call never reaches the client", "tool_call" not in answer, answer)
+    check("the preamble before the call is still shown", "let me check." in answer, answer)
+    check("the second round answers from the sources",
+          "from 1 source block(s)" in answer, answer)
+    tool_msgs = [m for m in sclient.get(f"/api/threads/{tt}").json()["messages"]
+                 if m["role"] == "tool"]
+    check("the model-initiated search is recorded too", len(tool_msgs) == 1)
+
+    scfg.search.max_rounds = 0
+    zt = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    before = len(provider.queries)
+    r = sclient.post(f"/api/threads/{zt}/messages", json={"content": "LOOKUP mlx please"})
+    check("max_rounds=0 refuses to act on the call", len(provider.queries) == before)
+    check("the turn still completes",
+          any(e["type"] == "done" for e in sse_events(r)))
+    scfg.search.max_rounds = 2
+    scfg.search.autonomous = "off"
+
+    # A model that emits tool syntax when no tool was offered is just writing
+    # text; stripping it would leave a hole in the reply.
+    nt = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    r = sclient.post(f"/api/threads/{nt}/messages",
+                     json={"content": '<tool_call>{"name": "web_search"}</tool_call>'})
+    answer = "".join(e["text"] for e in sse_events(r) if e["type"] == "token")
+    check("with no tool offered, tool syntax survives as text",
+          "tool_call" in answer, repr(answer))
+
+    # ---- a broken provider costs a note, not the turn
+    from hearth.search.providers import SearchError  # noqa: E402
+    sapp.state.websearch._provider = FakeProvider(error=SearchError("instance down"))
+    et = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    events = sse_events(sclient.post(f"/api/threads/{et}/messages",
+                                     json={"content": "/web anything"}))
+    errors = [e for e in events if e["type"] == "search" and e.get("phase") == "error"]
+    check("a provider failure is reported to the client", len(errors) == 1, str(events))
+    check("the model still answers", any(e["type"] == "done" for e in events))
+    answer = "".join(e["text"] for e in events if e["type"] == "token")
+    check("the answer is generated without sources", "you said:" in answer, answer)
+    sapp.state.websearch._provider = provider
+
+    # ---- cancel reports what it stopped
+    body = sclient.post("/api/cancel").json()
+    check("cancel counts in-flight searches", "searches" in body, str(body))
+
+    # ---- strict fields
+    check("an unknown search-ish field is still rejected",
+          sclient.post(f"/api/threads/{wt}/messages",
+                       json={"content": "x", "web": True}).status_code == 422)
+    check("the search field is accepted",
+          sclient.post(f"/api/threads/{wt}/messages",
+                       json={"content": "x", "search": False}).status_code == 200)
+
+    # ---- with search off, none of this happens
+    off = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    events = sse_events(client.post(f"/api/threads/{off}/messages",
+                                    json={"content": "/web anything", "search": True}))
+    errs = [e for e in events if e["type"] == "search" and e.get("phase") == "error"]
+    check("a server with search off says so", len(errs) == 1, str(events))
+    check("and answers anyway", any(e["type"] == "done" for e in events))
+finally:
+    web.__exit__(None, None, None)
+
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failures:", FAILED)

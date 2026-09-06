@@ -32,9 +32,14 @@ def _describe(messages):
 
     Returns (text of the last user turn, number of image markers across all
     turns) so tests can assert that vision plumbing reached the engine.
+
+    A retrieved block is projected onto the user role, so the "last user turn"
+    would otherwise be a wall of scraped HTML. Turns that carry a <source>
+    block are skipped for that purpose and counted separately instead.
     """
     last_text = ""
     markers = 0
+    sources = 0
     for m in messages:
         content = m.get("content")
         if isinstance(content, list):
@@ -46,20 +51,43 @@ def _describe(messages):
                 elif part.get("type") == "text" and m.get("role") == "user":
                     last_text = part.get("text", "")
         elif m.get("role") == "user":
-            last_text = content or ""
-    return last_text, markers
+            text = content or ""
+            if "<source id=" in text:
+                sources += 1
+            else:
+                last_text = text
+    return last_text, markers, sources
 
 
 def fake_text_stream(self, messages, images=None, max_tokens=None, temperature=None,
-                     top_p=None, thinking=None, cancel=None):
+                     top_p=None, thinking=None, tools=None, cancel=None):
     """Echo the last user turn, wrapped in a think block when reasoning is on.
 
     A prompt containing SLOW emits tokens slowly so cancellation can be tested.
+    A prompt containing LOOKUP emits a real tool call when tools are on offer,
+    but only until sources actually arrive - which is what makes the agent loop
+    terminate here for the same reason it terminates with a real model.
     """
     self.model = object()  # pretend we loaded
     images = images or []
-    last, markers = _describe(messages)
+    last, markers, sources = _describe(messages)
     yield {"type": "start", "thinking_open": False}
+
+    if tools and "LOOKUP" in last and not sources:
+        for piece in ["let me check. ", '<tool_call>{"name": "web_search", ',
+                      '"arguments": {"query": "mlx release"}}</tool_call>']:
+            yield {"type": "token", "text": piece}
+        yield {"type": "done", "text": "", "meta": {"model": "stub", "tools_offered": True}}
+        return
+
+    if sources:
+        reply = f"from {sources} source block(s): {last}"
+        for piece in [f"from {sources} source block(s): ", last]:
+            yield {"type": "token", "text": piece}
+        yield {"type": "done", "text": reply,
+               "meta": {"model": "stub", "sources_seen": sources,
+                        "tokens_per_second": 40.0}}
+        return
 
     if "SLOW" in last:
         for i in range(200):

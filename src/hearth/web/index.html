@@ -86,6 +86,16 @@
   details.think summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
     text-transform: uppercase; letter-spacing: .6px; }
   details.think .think-body { white-space: pre-wrap; margin-top: 6px; }
+
+  details.sources { margin-bottom: 8px; font-size: 13px; }
+  details.sources summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
+    user-select: none; }
+  details.sources ol { margin: 6px 0 0; padding-left: 22px; }
+  details.sources li { margin: 3px 0; }
+  details.sources a { color: var(--fg-dim); text-decoration: none; word-break: break-all; }
+  details.sources a:hover { text-decoration: underline; }
+  details.sources .src-url { display: block; font-size: 11px; color: var(--fg-faint); }
+  .msg.tool .body { color: var(--fg-faint); font-size: 12.5px; font-style: italic; }
   .stats { font-size: 11.5px; color: var(--fg-faint); margin-top: 6px;
     font-variant-numeric: tabular-nums; }
   .notice { font-size: 13px; color: var(--fg-dim); font-style: italic; }
@@ -167,6 +177,7 @@
       <div id="toolbar">
         <label><input type="checkbox" id="imgmode"> Image mode</label>
         <label><input type="checkbox" id="thinkmode"> Reasoning</label>
+        <label id="weblabel" hidden><input type="checkbox" id="webmode"> Web</label>
         <span class="hint">Enter to send &middot; drop, paste or attach an image</span>
       </div>
       <input type="file" id="file-input" accept="image/*" multiple hidden>
@@ -215,6 +226,13 @@ function md(src) {
     blocks[+i] === undefined ? whole : blocks[+i]);
 }
 
+// Source URLs reach here from a search provider and from stored history. The
+// markdown renderer already refuses to linkify anything but http(s); an <a>
+// built by hand needs the same rule.
+function safeHref(url) {
+  return /^https?:\/\//i.test(url || "") ? url : "#";
+}
+
 // ---------------- rendering ----------------
 function el(tag, cls, html) {
   const n = document.createElement(tag);
@@ -251,11 +269,44 @@ function useAsBase(name) {
   return wrap;
 }
 
+// A retrieval is a note about the conversation rather than a turn in it, so it
+// gets one dim line instead of a speaker label and a rendered markdown block.
+function renderToolMessage(m) {
+  const node = el("div", "msg tool");
+  const body = el("div", "body");
+  body.appendChild(el("div", null, esc(m.content)));
+  node.appendChild(body);
+  return node;
+}
+
+function sourceList(sources) {
+  const d = el("details", "sources");
+  d.appendChild(el("summary", null,
+    sources.length + (sources.length === 1 ? " source" : " sources")));
+  const ol = el("ol");
+  for (const s of sources) {
+    const li = el("li");
+    const a = el("a", null, esc(s.title || s.url));
+    a.href = safeHref(s.url);
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    li.appendChild(a);
+    li.appendChild(el("span", "src-url", esc(s.url)));
+    ol.appendChild(li);
+  }
+  d.appendChild(ol);
+  return d;
+}
+
 function renderMessage(m) {
+  if (m.role === "tool") return renderToolMessage(m);
   const node = el("div", "msg " + m.role);
   node.appendChild(el("div", "role", m.role === "user" ? "you" : "model"));
   const body = el("div", "body");
   const meta = m.meta || {};
+  if (meta.sources && meta.sources.length) {
+    body.appendChild(sourceList(meta.sources));
+  }
   if (meta.thinking) {
     const d = el("details", "think");
     d.appendChild(el("summary", null, "reasoning"));
@@ -495,6 +546,24 @@ async function send() {
     if (ev.type === "queued") { notice.textContent = "waiting for the model..."; return; }
     if (ev.type === "status") { notice.textContent = ev.text + "..."; return; }
 
+    if (ev.type === "search") {
+      if (ev.phase === "querying") {
+        notice.textContent = "searching the web for \u201c" + ev.query + "\u201d...";
+      } else if (ev.phase === "fetching") {
+        notice.textContent = "reading " + (ev.urls || []).length + " page(s)...";
+      } else if (ev.phase === "ready") {
+        // The strip goes in as soon as the sources are known, so it is on
+        // screen while the answer that cites it is still being written.
+        if (ev.sources && ev.sources.length) {
+          body.insertBefore(sourceList(ev.sources), body.firstChild);
+        }
+        notice.textContent = "thinking...";
+      } else if (ev.phase === "error") {
+        body.appendChild(el("div", "err", "web search unavailable: " + esc(ev.error)));
+      }
+      return;
+    }
+
     if (ev.type === "progress") {
       notice.textContent = "generating - step " + ev.step + "/" + ev.total;
       let bar = body.querySelector("progress");
@@ -568,6 +637,10 @@ async function send() {
       await streamSSE("/api/images", body, onEvent);
     } else {
       const body = { content: text, thinking: think };
+      // Only sent when ticked. Leaving it out means "whatever the server's
+      // policy is", which is what an unticked box should mean - sending false
+      // would override a server configured to decide for itself.
+      if ($("webmode").checked) body.search = true;
       if (atts.length) body.images = atts.map((a) => a.ref || a.src);
       await streamSSE("/api/threads/" + id + "/messages", body, onEvent);
     }
@@ -587,6 +660,12 @@ async function poll() {
   try {
     const s = await api("/api/status");
     $("dot").classList.add("on");
+    if (s.search) {
+      $("weblabel").hidden = !s.search.enabled;
+      $("weblabel").title = s.search.enabled
+        ? "Search the web before answering (" + s.search.provider + ")"
+        : s.search.reason;
+    }
     const loaded = ["text", "image"].filter((k) => s[k].loaded);
     $("sysinfo").textContent =
       (loaded.length ? loaded.join(" + ") + " loaded - " + s.memory.active_gb + " GB"

@@ -85,17 +85,50 @@ def human_age(ts: float) -> str:
 # streaming render
 # --------------------------------------------------------------------------
 
+def render_search_event(event: dict[str, Any]) -> None:
+    """Narrate a retrieval on stderr, so piped output stays just the answer."""
+    phase = event.get("phase")
+    if phase == "querying":
+        why = event.get("reason")
+        tail = f" [dim]({escape(why)})[/dim]" if why and why != "requested" else ""
+        err.print(
+            f"[dim]searching the web for [cyan]{escape(event['query'])}[/cyan]…[/dim]{tail}"
+        )
+    elif phase == "results":
+        found = event.get("results") or []
+        if not found:
+            err.print("[dim]  no results[/dim]")
+    elif phase == "fetching":
+        err.print(f"[dim]  reading {len(event.get('urls') or [])} page(s)…[/dim]")
+    elif phase == "ready":
+        for source in event.get("sources") or []:
+            err.print(
+                f"[dim]  {source['id']}. {escape(source['title'] or source['url'])}[/dim]\n"
+                f"[dim]     {escape(source['url'])}[/dim]"
+            )
+    elif phase == "error":
+        err.print(f"[yellow]web search unavailable: {escape(str(event.get('error')))}[/yellow]")
+
+
 def render_stream(
     events: Iterator[dict[str, Any]],
     client: HearthClient,
     show_thinking: bool = True,
     plain: bool = False,
+    show_sources: bool | None = None,
 ) -> dict[str, Any]:
     """Render an SSE event stream to the terminal.
 
     Returns the final `done` event. Ctrl-C cancels the generation server-side
     rather than killing the client, so a runaway answer costs you nothing.
+
+    `show_sources` is deliberately not folded into `plain`. Progress bars and a
+    tokens-per-second line are noise worth dropping when the output is piped,
+    but where a factual claim came from is not: it goes to stderr, which the
+    pipe never sees, and only `--quiet` turns it off.
     """
+    if show_sources is None:
+        show_sources = not plain
     final: dict[str, Any] = {}
     in_thinking = False
     wrote_any = False
@@ -112,6 +145,10 @@ def render_stream(
             elif etype == "status":
                 if not plain:
                     err.print(f"[dim]{event['text']}…[/dim]")
+
+            elif etype == "search":
+                if show_sources:
+                    render_search_event(event)
 
             elif etype == "progress":
                 if not plain:
@@ -256,6 +293,9 @@ def serve(
     if port:
         cfg.server.port = port
     config_mod.write_default()
+    for key in config_mod.missing_keys():
+        err.print(f"[dim]config has no {key}; using the default "
+                  f"(hearth config --sync to write it in)[/dim]")
 
     import logging
     import uvicorn
@@ -319,6 +359,10 @@ def ask(
     think: Optional[bool] = typer.Option(None, "--think/--no-think", help="Toggle reasoning mode."),
     max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
     temperature: Optional[float] = typer.Option(None, "--temperature"),
+    web: Optional[bool] = typer.Option(
+        None, "--web/--no-web",
+        help="Search the web before answering (or forbid it).",
+    ),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Answer only: no stats, no reasoning."),
 ) -> None:
     """One-shot question. Pipe-friendly: `cat bug.log | hearth ask 'what broke?'`
@@ -342,10 +386,12 @@ def ask(
             ref = _pick_thread(client, thread, new)
             final = render_stream(
                 client.send(ref, content, thinking=think, max_tokens=max_tokens,
-                            temperature=temperature, images=attachments or None),
+                            temperature=temperature, images=attachments or None,
+                            search=web),
                 client,
                 show_thinking=not plain,
                 plain=plain,
+                show_sources=not quiet,
             )
         except ServerUnavailable as exc:
             fail(str(exc))
@@ -468,6 +514,13 @@ def _print_message(m: dict[str, Any]) -> None:
     if not is_tty():
         print(f"[{role}] {m['content']}")
         return
+
+    # A retrieval is a fact about the conversation, not a turn in it: it gets
+    # one dim line rather than a speaker label and a markdown block.
+    if role == "tool":
+        console.print(f"[dim]{escape(m['content'])}[/dim]\n")
+        return
+
     label = {"user": "[bold green]you[/bold green]", "assistant": "[bold magenta]model[/bold magenta]"}.get(
         role, f"[bold]{role}[/bold]"
     )
@@ -549,6 +602,14 @@ def status() -> None:
     table.add_row("threads", str(st.get("threads", 0)))
     if st.get("images"):
         table.add_row("images", image_store_summary(st["images"]))
+    if st.get("search"):
+        info = st["search"]
+        if info["enabled"]:
+            mode = {"tool": "model decides", "heuristic": "auto-detected",
+                    "off": "when asked"}.get(info["autonomous"], info["autonomous"])
+            table.add_row("web search", f"[green]{info['provider']}[/green] [dim]({mode})[/dim]")
+        else:
+            table.add_row("web search", f"[dim]off - {info['reason']}[/dim]")
     console.print(table)
 
 
@@ -578,17 +639,42 @@ def pull(
 def config_cmd(
     edit: bool = typer.Option(False, "--edit", help="Open the config in $EDITOR."),
     path_only: bool = typer.Option(False, "--path", help="Print the config path and exit."),
+    sync: bool = typer.Option(
+        False, "--sync",
+        help="Add settings newer versions introduced, keeping your values.",
+    ),
 ) -> None:
     """Show or edit the configuration."""
     path = config_mod.write_default()
     if path_only:
         print(path)
         return
+    if sync:
+        added = config_mod.sync_config_file()
+        if added:
+            console.print(f"[dim]added to {path}:[/dim]")
+            for key in added:
+                console.print(f"  [cyan]{key}[/cyan]")
+        else:
+            console.print("[dim]nothing to add - the file has every setting[/dim]")
+        return
     if edit:
         os.system(f'{os.environ.get("EDITOR", "vi")} "{path}"')
         return
     console.print(f"[dim]{path}[/dim]\n")
-    console.print(path.read_text())
+    # Plain print, not console.print: rich reads "[search]" as a style tag, so
+    # every TOML section header silently vanished from this output. It also
+    # re-wraps long values, which is not what a file dump should do.
+    print(path.read_text())
+    # A config file is written once and never touched again, so one written
+    # before a feature existed has no way to mention it.
+    missing = config_mod.missing_keys()
+    if missing:
+        console.print(
+            f"\n[yellow]{len(missing)} setting(s) not in this file, running on "
+            f"defaults:[/yellow] [dim]{', '.join(missing)}[/dim]\n"
+            "[dim]hearth config --sync adds them[/dim]"
+        )
 
 
 @app.command(name="unload")
@@ -676,6 +762,8 @@ SLASH_COMMANDS = [
     Slash("/attach", "<path>", "queue an image for the model to look at"),
     Slash("/detach", "", "drop queued attachments"),
     Slash("/think", "on|off", "toggle reasoning mode", choices=("on", "off")),
+    Slash("/web", "on|off|<query>", "search the web now, or for every message",
+          choices=("on", "off")),
     Slash("/retry", "", "re-run your last message"),
     Slash("/title", "<text>", "rename this conversation"),
     Slash("/show", "", "reprint the conversation so far"),
@@ -755,6 +843,7 @@ def slash_completer():
 def chat(
     ref: Optional[str] = typer.Argument(None, help="Resume a thread (id, prefix, or 'last')."),
     think: bool = typer.Option(False, "--think", help="Start with reasoning mode on."),
+    web: bool = typer.Option(False, "--web", help="Start with web search on for every message."),
 ) -> None:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
@@ -765,10 +854,24 @@ def chat(
     client = HearthClient(cfg.base_url)
 
     try:
-        client.status()
+        server = client.status()
     except ServerUnavailable as exc:
         client.close()
         fail(str(exc))
+
+    # Whether the server can search at all is fixed when it starts, so this one
+    # snapshot stays accurate for the session - and it is what lets /web say so
+    # immediately instead of letting the user find out one message later.
+    search_info = server.get("search") or {}
+
+    def warn_if_no_search() -> bool:
+        if search_info.get("enabled"):
+            return True
+        console.print(
+            f"[yellow]this server cannot search:[/yellow] "
+            f"[dim]{search_info.get('reason', 'web search is off')}[/dim]"
+        )
+        return False
 
     if ref:
         try:
@@ -784,6 +887,8 @@ def chat(
         console.print(f"[dim]new conversation {thread['id']}[/dim]")
 
     console.print(f"[dim]{cfg.text.repo}[/dim]")
+    if search_info.get("enabled"):
+        console.print(f"[dim]web search via {search_info['provider']}[/dim]")
     console.print("[dim]/ for commands, /quit to exit[/dim]\n")
 
     history_path = config_mod.DATA_DIR / "cli_history"
@@ -800,6 +905,11 @@ def chat(
     )
 
     thinking_on = think
+    # None leaves the decision to the server's configured policy; True and
+    # False are the user overriding it for every message from here on.
+    search_on: bool | None = True if web else None
+    if web:
+        warn_if_no_search()
     last_user_message: str | None = None
     pending: list[Path] = []   # images queued by /attach for the next message
 
@@ -815,7 +925,7 @@ def chat(
         console.print()
         final = render_stream(
             client.send(thread["id"], content, thinking=thinking_on,
-                        images=attachments or None),
+                        images=attachments or None, search=search_on),
             client,
             show_thinking=True,
         )
@@ -925,6 +1035,27 @@ def chat(
             else:
                 thinking_on = not thinking_on
             console.print(f"[dim]reasoning mode {'on' if thinking_on else 'off'}[/dim]\n")
+
+        elif cmd == "/web":
+            if rest in ("on", "true", "1"):
+                if warn_if_no_search():
+                    console.print("[dim]web search on for every message[/dim]")
+                search_on = True
+                console.print()
+            elif rest in ("off", "false", "0"):
+                search_on = False
+                console.print("[dim]web search off[/dim]\n")
+            elif rest:
+                # A one-shot search. The server routes on the leading verb, so
+                # this is just a message - same as /image and /edit.
+                warn_if_no_search()
+                send(line)
+            else:
+                state = {True: "on", False: "off", None: "server default"}[search_on]
+                console.print(
+                    f"[dim]web search: {state}[/dim]\n"
+                    "[dim]/web <query> to search now, /web on|off to change it[/dim]\n"
+                )
 
         elif cmd == "/retry":
             if not last_user_message:

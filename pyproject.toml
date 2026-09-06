@@ -19,6 +19,12 @@ dependencies = [
     "tomli-w>=1.0",
 ]
 
+[project.optional-dependencies]
+# Better article extraction than the stdlib parser in search/fetch.py, which is
+# used automatically when this is installed. Kept optional because it pulls in
+# lxml, and the base install already carries mlx and mflux.
+search = ["trafilatura>=1.12"]
+
 [project.scripts]
 hearth = "hearth.cli:main"
 
