@@ -208,7 +208,12 @@ class WebSearch:
             return outcome.abandon()
 
         targets = results[: max(0, self.cfg.max_fetch)]
-        say({"phase": "fetching", "urls": [r.url for r in targets]})
+        # Only the ones we actually have to go and get. A provider that already
+        # extracted the page (Tavily) leaves nothing to fetch, which is faster
+        # and works on sites that would refuse us.
+        to_fetch = [r for r in targets if not r.content]
+        if to_fetch:
+            say({"phase": "fetching", "urls": [r.url for r in to_fetch]})
         pages = self._fetch_all(targets, cancel)
 
         for index, (result, page) in enumerate(zip(targets, pages), start=1):
@@ -245,6 +250,8 @@ class WebSearch:
             return []
 
         def one(result: Result) -> Page | Exception:
+            if result.content:
+                return Page(url=result.url, title=result.title, text=result.content)
             try:
                 return fetch(
                     result.url,
@@ -261,8 +268,8 @@ class WebSearch:
                 log.warning("unexpected error fetching %s: %s", result.url, exc)
                 return exc
 
-        if len(targets) == 1:
-            return [one(targets[0])]
+        if len(targets) == 1 or not any(not r.content for r in targets):
+            return [one(r) for r in targets]
         with ThreadPoolExecutor(max_workers=len(targets)) as pool:
             return list(pool.map(one, targets))
 

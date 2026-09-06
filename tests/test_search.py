@@ -32,7 +32,7 @@ from hearth.search.fetch import (  # noqa: E402
     resolve_guarded,
 )
 from hearth.search.heuristics import should_search  # noqa: E402
-from hearth.search.providers import SearxngProvider  # noqa: E402
+from hearth.search.providers import SearxngProvider, TavilyProvider  # noqa: E402
 from hearth.textutil import ToolCallSplitter, tool_call_query  # noqa: E402
 
 PASSED: list[str] = []
@@ -183,6 +183,65 @@ with FixtureWeb() as web:
     from hearth.search.providers import SearchError
     check("an unreachable instance raises SearchError",
           raises(SearchError, unreachable.search, "x", 3))
+
+
+# --------------------------------------------------------------------------
+print("\nTavily")
+
+with FixtureWeb() as web:
+    import hearth.search.providers as providers_mod
+    original = providers_mod.TAVILY_ENDPOINT
+    providers_mod.TAVILY_ENDPOINT = web.url("/tavily")
+    try:
+        web.set_tavily([
+            {"url": "https://a.example/1", "title": "First",
+             "content": "a scored excerpt", "raw_content": "the whole page text"},
+            {"url": "https://b.example/2", "title": "Second",
+             "content": "only an excerpt", "raw_content": None},
+            {"url": "javascript:alert(1)", "title": "hostile", "content": "x"},
+        ], answer="a cloud model wrote this")
+
+        tav = TavilyProvider("test-key", timeout=5.0, user_agent="test")
+        got = tav.search("anything", 5)
+        check("tavily results are normalised", len(got) == 2, str(len(got)))
+        check("the extracted page comes back as content",
+              got[0].content == "the whole page text", repr(got[0].content))
+        check("the excerpt is kept as the snippet", got[0].snippet == "a scored excerpt")
+        check("a missing raw_content falls back to the excerpt",
+              got[1].content == "only an excerpt", repr(got[1].content))
+        check("a hostile url is dropped here too",
+              all(r.url.startswith("https://") for r in got))
+
+        bad = TavilyProvider("wrong-key", timeout=5.0, user_agent="test")
+        check("a bad tavily key raises SearchError",
+              raises(providers_mod.SearchError, bad.search, "x", 3))
+
+        # Content already in hand means nothing gets fetched.
+        cfg = config_mod.SearchConfig(
+            enabled=True, provider="tavily", tavily_api_key="test-key",
+            max_fetch=2, max_context_chars=4000, timeout_s=5.0,
+        )
+        searcher = WebSearch(cfg)
+        events: list[dict] = []
+        outcome = searcher.run("anything", emit=events.append)
+        phases = [e["phase"] for e in events]
+        check("no fetching phase when the provider supplied the pages",
+              "fetching" not in phases, str(phases))
+        check("the documents carry the provider's page text",
+              outcome.documents[0].text == "the whole page text")
+        check("nothing is marked as a fetch failure",
+              all(d.error is None for d in outcome.documents))
+        check("the packed block uses that text",
+              "the whole page text" in searcher.pack(outcome))
+    finally:
+        providers_mod.TAVILY_ENDPOINT = original
+
+check("tavily is a known provider name",
+      config_mod.SearchConfig(enabled=True, provider="tavily",
+                              tavily_api_key="k").provider == "tavily")
+unknown = WebSearch(config_mod.SearchConfig(enabled=True, provider="nope"))
+check("an unknown provider names the valid ones",
+      "tavily" in unknown.unavailable_reason, unknown.unavailable_reason)
 
 
 # --------------------------------------------------------------------------

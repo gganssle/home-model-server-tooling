@@ -56,6 +56,19 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def do_POST(self):  # noqa: N802 - stdlib naming
+        """Tavily's API is a POST, and it answers with the page text inline."""
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        if self.path.split("?")[0] != "/tavily":
+            self._send(404, b"nope", "text/plain")
+            return
+        if self.headers.get("Authorization") != "Bearer test-key":
+            self._send(401, b"bad key", "text/plain")
+            return
+        self._send(200, json.dumps(self.server.tavily_payload).encode(),
+                   "application/json")
+
     def do_GET(self):  # noqa: N802 - stdlib naming
         path = self.path.split("?")[0]
 
@@ -107,12 +120,19 @@ class FixtureWeb:
     def __init__(self, search_payload: dict | None = None) -> None:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.server.search_payload = search_payload or {"results": []}
+        self.server.tavily_payload = {"results": []}
         self.port = self.server.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def set_results(self, results: list[dict]) -> None:
         self.server.search_payload = {"results": results}
+
+    def set_tavily(self, results: list[dict], answer: str | None = None) -> None:
+        payload: dict = {"results": results}
+        if answer is not None:
+            payload["answer"] = answer
+        self.server.tavily_payload = payload
 
     def url(self, path: str) -> str:
         return f"{self.base}{path}"

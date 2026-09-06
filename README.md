@@ -215,8 +215,26 @@ If your config predates this feature it has no `[search]` section at all — run
 server can search, and `hearth chat` says so in its banner and refuses to
 pretend otherwise when you type `/web on`.
 
-**Brave** works too if you would rather not host anything — set
-`provider = "brave"` and a `brave_api_key` (or `HEARTH_BRAVE_KEY`).
+**Tavily** is the easiest if you would rather not host anything. It is built
+for this use rather than being a general web index, and it returns the
+extracted page text alongside each hit — so hearth does no fetching at all,
+which is both faster and the only thing that works on the large number of
+sites that refuse anything not shaped like a browser.
+
+```toml
+[search]
+enabled = true
+provider = "tavily"
+tavily_api_key = "tvly-..."
+tavily_depth = "basic"     # "advanced" digs harder and costs two credits
+```
+
+hearth never asks Tavily for its `answer` field. That has a cloud model write
+the reply, which is exactly what this project exists not to do — only the
+search results come back, and your local model does the answering.
+
+**Brave** is also supported — `provider = "brave"` and a `brave_api_key` (or
+`HEARTH_BRAVE_KEY`).
 
 `hearth status` shows which one is live, or why none is.
 
@@ -349,11 +367,13 @@ image_strength = 0.6       # default for --from / /edit, 0-1
 
 [search]
 enabled = false            # off until you point it at a provider
-provider = "searxng"       # searxng | brave | none
+provider = "searxng"       # searxng | tavily | brave | none
 searxng_url = "http://127.0.0.1:8888"
+tavily_api_key = ""
+tavily_depth = "basic"     # basic | advanced
 brave_api_key = ""
 max_results = 5            # results asked of the provider
-max_fetch = 3              # of those, how many pages are actually read
+max_fetch = 3              # of those, how many pages are read (Tavily supplies them)
 max_context_chars = 6000   # hard ceiling on retrieved text in the prompt
 max_history_documents = 1  # how many past searches keep their full page text
 autonomous = "off"         # off | heuristic | tool

@@ -64,11 +64,15 @@ class SearchConfig:
     """Web retrieval. Off until a provider is actually reachable."""
 
     enabled: bool = False
-    # searxng | brave | none. SearXNG is the default because it can be
-    # self-hosted, which keeps the query on hardware you control - the same
+    # searxng | tavily | brave | none. SearXNG is the default because it can
+    # be self-hosted, which keeps the query on hardware you control - the same
     # reason the models are local.
     provider: str = "searxng"
     searxng_url: str = "http://127.0.0.1:8888"
+    tavily_api_key: str = ""
+    # basic or advanced. Advanced digs harder and costs two credits instead of
+    # one; basic is enough for most questions.
+    tavily_depth: str = "basic"
     brave_api_key: str = ""
     max_results: int = 5
     max_fetch: int = 3
@@ -145,6 +149,7 @@ def _apply_env(cfg: Config) -> None:
         "HEARTH_SEARCH": (cfg.search, "enabled", lambda v: v.lower() in ("1", "true", "yes")),
         "HEARTH_SEARCH_PROVIDER": (cfg.search, "provider", str),
         "HEARTH_SEARXNG_URL": (cfg.search, "searxng_url", str),
+        "HEARTH_TAVILY_KEY": (cfg.search, "tavily_api_key", str),
         "HEARTH_BRAVE_KEY": (cfg.search, "brave_api_key", str),
         "HEARTH_SEARCH_AUTONOMOUS": (cfg.search, "autonomous", str),
         "HEARTH_SEARCH_ALLOW_PRIVATE": (

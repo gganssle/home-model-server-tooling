@@ -61,8 +61,21 @@ class Result:
 
 Default is **SearXNG**, pointed at an instance the user runs. No API key, no
 third party sees the query, which is the same reason the models are local.
-Brave's API is supported for people who would rather not host anything. With no
-provider configured, search stays off and says so instead of failing obscurely.
+**Tavily** and **Brave** are supported for people who would rather not host
+anything. With no provider configured, search stays off and says so instead of
+failing obscurely.
+
+Tavily is the odd one out and worth a note: it returns the extracted page text
+with each hit, so `Result.content` comes back filled in and the fetch stage is
+skipped entirely for those results. That is not just a latency win. Fetching
+pages yourself fails on a large fraction of the web — Cloudflare and friends
+refuse anything that does not look like a browser — and a provider that has
+already done the extraction sidesteps the whole problem. The cost is trusting
+someone else's extraction, and the guards in `fetch.py` never running because
+there is nothing to fetch.
+
+Tavily's `answer` field is never requested. It has a cloud model write the
+reply, which is the one thing this project must not do.
 
 ### Fetch
 
