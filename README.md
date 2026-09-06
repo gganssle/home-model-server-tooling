@@ -210,6 +210,11 @@ provider = "searxng"
 searxng_url = "http://127.0.0.1:8888"
 ```
 
+If your config predates this feature it has no `[search]` section at all — run
+`hearth config --sync` first, then edit. `hearth status` shows whether the
+server can search, and `hearth chat` says so in its banner and refuses to
+pretend otherwise when you type `/web on`.
+
 **Brave** works too if you would rather not host anything — set
 `provider = "brave"` and a `brave_api_key` (or `HEARTH_BRAVE_KEY`).
 
@@ -309,6 +314,15 @@ is stored on the message, so you can go back and read it later.
 
 `~/.config/hearth/config.toml`, created on first run. `hearth config --edit`
 opens it.
+
+The file is written once and never rewritten, so one created before a feature
+existed simply will not mention it — `hearth config` lists anything you are
+running on defaults, and `hearth config --sync` writes those settings in
+without touching the values you already set:
+
+```bash
+hearth config --sync
+```
 
 ```toml
 [server]

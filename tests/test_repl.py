@@ -133,6 +133,8 @@ def main() -> int:
         print("\nstartup")
         repl = Repl()
         check("banner shows a new conversation", repl.read_until("new conversation"))
+        check("the banner names the search provider",
+              repl.read_until("web search via searxng"), repr(repl.buf[:400]))
         check("prompt appears", repl.read_until("you"))
 
         print("\nchat turn")

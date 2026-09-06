@@ -360,6 +360,42 @@ check("the date is given even with no cutoff",
       "2026-09-05" in config_mod.system_prompt(bare, today=date(2026, 9, 5)))
 
 
+# --------------------------------------------------------------------------
+print("\nconfig drift")
+
+import tomli_w  # noqa: E402
+
+config_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+# A file as it would have been written before any of this existed.
+old_shape = {
+    "server": {"host": "127.0.0.1", "port": 8080},
+    "models": {"text": {"repo": "something/custom", "temperature": 0.3}},
+    "memory": {"idle_evict_seconds": 60},
+}
+with config_mod.CONFIG_PATH.open("wb") as fh:
+    tomli_w.dump(old_shape, fh)
+
+missing = config_mod.missing_keys()
+check("a pre-feature config reports the whole search section missing",
+      "search" in missing, str(missing))
+check("it also reports newer keys inside existing sections",
+      "models.text.knowledge_cutoff" in missing, str(missing))
+check("it does not report keys that are present",
+      "models.text.repo" not in missing and "server.port" not in missing, str(missing))
+
+added = config_mod.sync_config_file()
+check("sync reports what it added", set(added) == set(missing), str(added))
+reloaded = config_mod.load()
+check("sync preserves a customised value", reloaded.text.repo == "something/custom")
+check("sync preserves another customised value", reloaded.text.temperature == 0.3)
+check("sync preserves other sections", reloaded.memory.idle_evict_seconds == 60)
+check("sync fills in the new section", reloaded.search.provider == "searxng")
+check("sync leaves the new section switched off", reloaded.search.enabled is False)
+check("a synced file has nothing left missing", config_mod.missing_keys() == [])
+check("syncing twice is a no-op", config_mod.sync_config_file() == [])
+config_mod.CONFIG_PATH.unlink()
+
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failures:", FAILED)

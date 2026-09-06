@@ -122,6 +122,19 @@ def main() -> int:
         r = run("ask", "--help")
         check("ask documents --web", "--web" in r.stdout, r.stdout[:600])
 
+        print("\nconfig drift")
+        r = run("config")
+        check("config lists settings the file has never heard of",
+              "not in this file" in r.stdout or "knowledge_cutoff" in r.stdout,
+              r.stdout[-400:])
+        r = run("config", "--sync")
+        check("config --sync reports what it wrote",
+              "added to" in r.stdout or "nothing to add" in r.stdout, r.stdout[:300])
+        r = run("config")
+        check("after syncing nothing is missing",
+              "not in this file" not in r.stdout, r.stdout[-300:])
+        check("syncing kept the search section", "[search]" in r.stdout, r.stdout[-600:])
+
         print("\nask")
         r = run("ask", "hello there")
         check("ask returns the answer on stdout",

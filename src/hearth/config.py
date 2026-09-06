@@ -195,21 +195,80 @@ def image_store_stats(cfg: Config) -> dict[str, Any]:
     }
 
 
-def write_default(force: bool = False) -> Path:
-    """Materialize a commented default config file."""
-    if CONFIG_PATH.exists() and not force:
-        return CONFIG_PATH
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def _default_payload() -> dict[str, Any]:
     cfg = Config()
-    payload = {
+    return {
         "server": asdict(cfg.server),
         "models": {"text": asdict(cfg.text), "image": asdict(cfg.image)},
         "search": asdict(cfg.search),
         "memory": asdict(cfg.memory),
     }
+
+
+def write_default(force: bool = False) -> Path:
+    """Materialize a default config file."""
+    if CONFIG_PATH.exists() and not force:
+        return CONFIG_PATH
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with CONFIG_PATH.open("wb") as fh:
-        tomli_w.dump(payload, fh)
+        tomli_w.dump(_default_payload(), fh)
     return CONFIG_PATH
+
+
+def _walk_missing(present: dict[str, Any], defaults: dict[str, Any], prefix: str = ""):
+    """Yield dotted names for keys in `defaults` that `present` lacks."""
+    for key, value in defaults.items():
+        path = f"{prefix}{key}"
+        if key not in present:
+            yield path
+        elif isinstance(value, dict) and isinstance(present.get(key), dict):
+            yield from _walk_missing(present[key], value, f"{path}.")
+
+
+def missing_keys() -> list[str]:
+    """Settings this version knows about that the config file has never heard of.
+
+    A config file is written once, on first run, and never touched again - so a
+    file created before a feature existed has no way to mention it. Without
+    this, the only way to discover a new setting is to read the source or the
+    README, which is not where anyone looks.
+    """
+    if not CONFIG_PATH.exists():
+        return []
+    try:
+        with CONFIG_PATH.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return list(_walk_missing(data, _default_payload()))
+
+
+def _fill_missing(present: dict[str, Any], defaults: dict[str, Any]) -> None:
+    for key, value in defaults.items():
+        if key not in present:
+            present[key] = value
+        elif isinstance(value, dict) and isinstance(present.get(key), dict):
+            _fill_missing(present[key], value)
+
+
+def sync_config_file() -> list[str]:
+    """Add settings the file is missing, leaving every existing value alone.
+
+    Rewrites the file, so any comments a user added by hand are lost - which is
+    why this is an explicit command rather than something `serve` does behind
+    their back.
+    """
+    if not CONFIG_PATH.exists():
+        write_default()
+        return []
+    with CONFIG_PATH.open("rb") as fh:
+        data = tomllib.load(fh)
+    added = list(_walk_missing(data, _default_payload()))
+    if added:
+        _fill_missing(data, _default_payload())
+        with CONFIG_PATH.open("wb") as fh:
+            tomli_w.dump(data, fh)
+    return added
 
 
 # The standing instruction that accompanies retrieved pages. It lives in the

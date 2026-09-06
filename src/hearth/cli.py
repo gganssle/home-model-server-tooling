@@ -293,6 +293,9 @@ def serve(
     if port:
         cfg.server.port = port
     config_mod.write_default()
+    for key in config_mod.missing_keys():
+        err.print(f"[dim]config has no {key}; using the default "
+                  f"(hearth config --sync to write it in)[/dim]")
 
     import logging
     import uvicorn
@@ -636,17 +639,42 @@ def pull(
 def config_cmd(
     edit: bool = typer.Option(False, "--edit", help="Open the config in $EDITOR."),
     path_only: bool = typer.Option(False, "--path", help="Print the config path and exit."),
+    sync: bool = typer.Option(
+        False, "--sync",
+        help="Add settings newer versions introduced, keeping your values.",
+    ),
 ) -> None:
     """Show or edit the configuration."""
     path = config_mod.write_default()
     if path_only:
         print(path)
         return
+    if sync:
+        added = config_mod.sync_config_file()
+        if added:
+            console.print(f"[dim]added to {path}:[/dim]")
+            for key in added:
+                console.print(f"  [cyan]{key}[/cyan]")
+        else:
+            console.print("[dim]nothing to add - the file has every setting[/dim]")
+        return
     if edit:
         os.system(f'{os.environ.get("EDITOR", "vi")} "{path}"')
         return
     console.print(f"[dim]{path}[/dim]\n")
-    console.print(path.read_text())
+    # Plain print, not console.print: rich reads "[search]" as a style tag, so
+    # every TOML section header silently vanished from this output. It also
+    # re-wraps long values, which is not what a file dump should do.
+    print(path.read_text())
+    # A config file is written once and never touched again, so one written
+    # before a feature existed has no way to mention it.
+    missing = config_mod.missing_keys()
+    if missing:
+        console.print(
+            f"\n[yellow]{len(missing)} setting(s) not in this file, running on "
+            f"defaults:[/yellow] [dim]{', '.join(missing)}[/dim]\n"
+            "[dim]hearth config --sync adds them[/dim]"
+        )
 
 
 @app.command(name="unload")
@@ -826,10 +854,24 @@ def chat(
     client = HearthClient(cfg.base_url)
 
     try:
-        client.status()
+        server = client.status()
     except ServerUnavailable as exc:
         client.close()
         fail(str(exc))
+
+    # Whether the server can search at all is fixed when it starts, so this one
+    # snapshot stays accurate for the session - and it is what lets /web say so
+    # immediately instead of letting the user find out one message later.
+    search_info = server.get("search") or {}
+
+    def warn_if_no_search() -> bool:
+        if search_info.get("enabled"):
+            return True
+        console.print(
+            f"[yellow]this server cannot search:[/yellow] "
+            f"[dim]{search_info.get('reason', 'web search is off')}[/dim]"
+        )
+        return False
 
     if ref:
         try:
@@ -845,6 +887,8 @@ def chat(
         console.print(f"[dim]new conversation {thread['id']}[/dim]")
 
     console.print(f"[dim]{cfg.text.repo}[/dim]")
+    if search_info.get("enabled"):
+        console.print(f"[dim]web search via {search_info['provider']}[/dim]")
     console.print("[dim]/ for commands, /quit to exit[/dim]\n")
 
     history_path = config_mod.DATA_DIR / "cli_history"
@@ -864,6 +908,8 @@ def chat(
     # None leaves the decision to the server's configured policy; True and
     # False are the user overriding it for every message from here on.
     search_on: bool | None = True if web else None
+    if web:
+        warn_if_no_search()
     last_user_message: str | None = None
     pending: list[Path] = []   # images queued by /attach for the next message
 
@@ -992,14 +1038,17 @@ def chat(
 
         elif cmd == "/web":
             if rest in ("on", "true", "1"):
+                if warn_if_no_search():
+                    console.print("[dim]web search on for every message[/dim]")
                 search_on = True
-                console.print("[dim]web search on for every message[/dim]\n")
+                console.print()
             elif rest in ("off", "false", "0"):
                 search_on = False
                 console.print("[dim]web search off[/dim]\n")
             elif rest:
                 # A one-shot search. The server routes on the leading verb, so
                 # this is just a message - same as /image and /edit.
+                warn_if_no_search()
                 send(line)
             else:
                 state = {True: "on", False: "off", None: "server default"}[search_on]
