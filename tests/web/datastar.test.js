@@ -100,6 +100,16 @@ for (const name of ['bind', 'ref', 'indicator']) {
   check(`data-${name} is used and supported`, seen.has(name) && plugins.has(name));
 }
 
+// The drawer breakpoint is written twice - once as a media query, once as the
+// width the `narrow` signal is tested against - and the two only agree by
+// hand. A phone that CSS calls narrow while the page calls it wide gets a
+// drawer that will not open.
+const cssBreak = [...raw.matchAll(/@media \(max-width: (\d+)px\)/g)].map((m) => m[1]);
+const jsBreak = [...raw.matchAll(/innerWidth\s*(?:&[lg]t;=?|[<>]=?)\s*(\d+)/g)].map((m) => m[1]);
+check('the narrow breakpoint is one number', jsBreak.length > 0 &&
+      new Set([...cssBreak, ...jsBreak]).size === 1,
+      `css: ${cssBreak.join(' ')} / js: ${jsBreak.join(' ')}`);
+
 // The frontend is meant to work with the network off.
 check('no external script or style is loaded',
       !/<(script|link)[^>]+(src|href)="https?:/.test(raw));

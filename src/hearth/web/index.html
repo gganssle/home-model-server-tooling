@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- `viewport-fit=cover` lets the page paint under the notch and the home
+     indicator; the composer and the drawer pay it back with `env(safe-area-*)`. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#fff9e3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0417" media="(prefers-color-scheme: dark)">
 <title>hearth</title>
 <!--
   The whole frontend. There is no build step and almost no JavaScript: the
@@ -13,6 +17,9 @@
 
   Signals, in full:
     thread    id of the open conversation, "" for a fresh one
+    nav       whether the conversation pane is showing
+    narrow    whether the viewport is phone-sized; the drawer breakpoint
+    touch     whether the pointer is a finger, decided once at load
     draft     the composer's text
     search    the sidebar filter
     imgmode   draw instead of chat
@@ -31,167 +38,391 @@
 -->
 <script type="module" src="/datastar.js"></script>
 <style>
+  /* ---------- palette ----------
+     Loud on purpose. The four neons are decoration - borders, glows, gradient
+     fills - and are the same in both themes so the thing keeps its identity;
+     anything that has to be *read* uses a theme-tuned variable instead, and
+     every one of those clears 4.5:1 against the surface it lands on. That
+     split is the whole trick: the noise lives in the chrome, the contrast
+     lives in the text.
+
+     Light is highlighter-on-paper, dark is a blacklight basement. Code is a
+     dark terminal chip in both, which is why it carries its own foreground.
+     --btn-ink is the ink for text sitting on a neon gradient: always dark,
+     because cream on amber is unreadable and amber is in every gradient. */
   :root {
-    --bg: #ffffff; --bg-alt: #f6f7f9; --bg-inset: #eceef2;
-    --fg: #16181d; --fg-dim: #6b7280; --fg-faint: #9aa1ad;
-    --border: #e3e6eb; --accent: #b4530a; --accent-fg: #ffffff;
-    --user-bg: #eef1f6; --code-bg: #f2f3f6; --danger: #b42318;
-    --radius: 10px;
+    --bg: #fff9e3; --bg-alt: #ffe6f7; --bg-inset: #ccf7ff;
+    --fg: #1a0130; --fg-dim: #6b1a80; --fg-faint: #9c3b8f;
+    --border: #ff69d2; --accent: #d1008c; --accent-fg: #fff9e3;
+    --user-bg: #ccf7ff; --code-bg: #17032b; --danger: #c9003f;
+    --head: #7b00c8; --link: #b400b4;
+      /* Deep risograph inks: the light theme's four "neons". Vivid hues, but
+         dark enough to be read on paper. */
+      --n1: #d6009a; --n2: #0083a8; --n3: #467600; --n4: #a06000;
+    --wash-1: rgba(255, 54, 192, .20); --wash-2: rgba(36, 224, 255, .22);
+    --wash-3: rgba(182, 255, 58, .22);
+    --glass: rgba(255, 249, 227, .74);
+    --radius: 14px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #16181d; --bg-alt: #1c1f26; --bg-inset: #23272f;
-      --fg: #e8eaed; --fg-dim: #9aa1ad; --fg-faint: #6b7280;
-      --border: #2b2f38; --accent: #e8853a; --accent-fg: #16181d;
-      --user-bg: #23272f; --code-bg: #12141a; --danger: #f87171;
+      --bg: #0b0417; --bg-alt: #150829; --bg-inset: #26104a;
+      --fg: #f4ecff; --fg-dim: #c0a8ff; --fg-faint: #8b73d6;
+      --border: #46228f; --accent: #ff36c0; --accent-fg: #14002a;
+      --user-bg: #1e0b3d; --code-bg: #05010d; --danger: #ff5470;
+      --head: #b6ff3a; --link: #35e6ff;
+      --n1: #ff5ecb; --n2: #4ce9ff; --n3: #c9ff6a; --n4: #ffcc4d;
+      --wash-1: rgba(255, 54, 192, .18); --wash-2: rgba(36, 224, 255, .16);
+      --wash-3: rgba(182, 255, 58, .12);
+      --glass: rgba(11, 4, 23, .72);
     }
+  }
+  :root {
+    /* --n1..--n4 are theme-tuned above and are safe as text or as a border.
+       --v1..--v4 are the same four hues at full blast and never vary: they
+       are only ever a fill under --btn-ink, or a glow, where the background
+       is chosen rather than inherited. Reach for a --v where the colour is
+       the surface, and an --n where something has to be read against one. */
+    --v1: #ff36c0; --v2: #24e0ff; --v3: #b6ff3a; --v4: #ffc22e;
+    --grad: linear-gradient(96deg, var(--n1), var(--n4) 42%, var(--n2) 74%, var(--n3));
+    --code-fg: #a8ff9e; --btn-ink: #17032b;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--fg);
+    /* `dvh` follows the mobile browser's chrome as it hides and reappears;
+       `100%` alone leaves the composer under the URL bar. Ignored where it is
+       not understood, which is why the line above stays. */
+    height: 100dvh;
+    margin: 0; color: var(--fg);
+    /* Three coloured lamps pointed at the page. `#main` is transparent, so
+       this is what the conversation is actually read against - hence washes
+       weak enough to leave the text alone. */
+    background:
+      radial-gradient(900px 520px at 6% -8%, var(--wash-1), transparent 62%),
+      radial-gradient(820px 520px at 104% 2%, var(--wash-2), transparent 58%),
+      radial-gradient(760px 620px at 46% 118%, var(--wash-3), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
     font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     display: flex; overflow: hidden;
+    -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent;
+  }
+  /* Prose stays in the system sans, because paragraphs are for reading. Every
+     piece of chrome around it goes monospace and shouty - that contrast is
+     what makes the thing look built rather than merely coloured. */
+  #brand, #topbrand, #new-btn, #search, .thread, .thread-empty, #sysinfo,
+  #toolbar, .hint, #send, #stop, .msg .role, .stats, .slash-row, .empty,
+  .imgactions button, #strengthrow { font-family: var(--mono); }
+  ::selection { background: var(--v3); color: var(--btn-ink); }
+  a { color: var(--link); }
+  a:hover { color: var(--n1); text-decoration: underline wavy var(--n1); }
+  input, textarea, button, progress { accent-color: var(--n1); }
+  * { scrollbar-width: thin; scrollbar-color: var(--n1) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: linear-gradient(var(--v1), var(--v2)); border-radius: 8px;
+    border: 2px solid transparent; background-clip: padding-box; }
+  /* Gradient text, but only where it will actually be painted - without the
+     clip, `color: transparent` is an invisible word. */
+  @supports (background-clip: text) or (-webkit-background-clip: text) {
+    #brand, #topbrand, .empty h1 {
+      background: var(--grad);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
   }
 
   /* ---------- sidebar ---------- */
+  /* Open or closed is the `nav` signal, which reaches the element as a
+     class. A class rather than `data-show` because the two widths hide it
+     differently: wide takes it out of the layout, narrow slides it over the
+     page. It is two classes rather than one so that the bare element - what
+     the browser paints before Datastar has run - is already right at either
+     width: wide hides `.closed`, narrow shows `.open`. */
   #sidebar {
-    width: 264px; flex: 0 0 264px; background: var(--bg-alt);
-    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    width: 264px; flex: 0 0 264px;
+    background: linear-gradient(178deg, var(--bg-alt), transparent 70%), var(--bg);
+    border-right: 2px solid var(--border); display: flex; flex-direction: column;
+    padding-top: env(safe-area-inset-top);
   }
+  #sidebar.closed { display: none; }
+  #scrim { display: none; position: fixed; inset: 0; z-index: 25;
+    background: radial-gradient(120% 90% at 0% 50%, rgba(255, 54, 192, .34), rgba(6, 0, 16, .68)); }
   #brand {
-    padding: 14px 16px; font-weight: 650; letter-spacing: .3px;
-    display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border);
+    padding: 15px 16px; font-weight: 800; letter-spacing: 4px; font-size: 17px;
+    text-transform: uppercase;
+    display: flex; align-items: center; gap: 9px; border-bottom: 2px solid var(--border);
   }
-  #brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg-faint); }
-  #brand .dot.on { background: #34d399; }
+  /* The dot keeps its own background while the brand's gradient is clipped to
+     the text around it, so it survives the trick above. */
+  #brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint);
+    flex: 0 0 auto; }
+  #brand .dot.on { background: var(--n3); box-shadow: 0 0 12px var(--v3);
+    animation: beat 1.9s ease-in-out infinite; }
+  @keyframes beat { 50% { box-shadow: 0 0 3px var(--v3); opacity: .5; } }
   #new-btn {
-    margin: 12px; padding: 9px 12px; border: 1px solid var(--border); background: var(--bg);
+    margin: 12px; padding: 10px 12px; border: 2px dashed var(--border); background: none;
     color: var(--fg); border-radius: var(--radius); cursor: pointer; font: inherit;
-    font-weight: 550; text-align: left;
+    font-weight: 700; text-align: left; text-transform: uppercase; letter-spacing: 1px;
+    font-size: 12px;
   }
-  #new-btn:hover { border-color: var(--accent); color: var(--accent); }
-  #search { margin: 0 12px 8px; padding: 7px 10px; border: 1px solid var(--border);
+  #new-btn:hover { border-style: solid; border-color: var(--n3); color: var(--n3);
+    background: var(--bg-inset); box-shadow: 0 0 18px -4px var(--v3); }
+  #search { margin: 0 12px 8px; padding: 8px 10px; border: 2px solid var(--border);
     background: var(--bg); color: var(--fg); border-radius: 8px; font: inherit; font-size: 13px; }
-  #threads { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+  #search:focus { outline: none; border-color: var(--n2); box-shadow: 0 0 16px -4px var(--v2); }
+  #threads { flex: 1; overflow-y: auto; overscroll-behavior: contain;
+    padding: 0 8px 12px; }
+  /* Every row picks up one of the four neons, cycling down the list, so the
+     sidebar reads as a stack of coloured tabs rather than a list of text. */
   .thread {
-    padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
     display: flex; align-items: center; gap: 6px; color: var(--fg-dim);
+    border-left: 3px solid var(--n1); margin-bottom: 3px;
   }
+  .thread:nth-child(4n+2) { border-left-color: var(--n2); }
+  .thread:nth-child(4n+3) { border-left-color: var(--n3); }
+  .thread:nth-child(4n+4) { border-left-color: var(--n4); }
   .thread:hover { background: var(--bg-inset); color: var(--fg); }
-  .thread.active { background: var(--bg-inset); color: var(--fg); font-weight: 550; }
+  .thread.active { color: var(--fg); font-weight: 700;
+    background: linear-gradient(90deg, var(--bg-inset), transparent); }
   .thread .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .thread .del { opacity: 0; border: none; background: none; color: var(--fg-faint);
+  .thread .del { border: none; background: none; color: var(--fg-faint);
     cursor: pointer; font-size: 15px; padding: 0 2px; line-height: 1; }
-  .thread:hover .del { opacity: 1; }
+  /* There is no hover on a phone, so the reveal is only asked for where a
+     pointer can actually do it. */
+  @media (hover: hover) {
+    .thread .del { opacity: 0; }
+    .thread:hover .del { opacity: 1; }
+  }
   .thread .del:hover { color: var(--danger); }
   .thread-empty { padding: 8px 10px; font-size: 13px; color: var(--fg-faint); }
-  #sysinfo { padding: 10px 16px; border-top: 1px solid var(--border);
-    font-size: 11.5px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  #sysinfo { padding: 10px 16px max(10px, env(safe-area-inset-bottom));
+    border-top: 2px solid var(--border); text-transform: uppercase; letter-spacing: .8px;
+    font-size: 10.5px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }
 
   /* ---------- main ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #messages { flex: 1; overflow-y: auto; padding: 28px 0 8px; }
+  /* Wide, this is just somewhere for the toggle to live; narrow, it becomes
+     the app bar and picks up the brand and a new-conversation button. */
+  #topbar { flex: 0 0 auto; display: flex; align-items: center; gap: 4px;
+    padding: max(6px, env(safe-area-inset-top)) 8px 0; }
+  #nav-toggle, #top-new { border: 2px solid transparent; background: none; color: var(--n1);
+    font: inherit; font-size: 17px; line-height: 1; cursor: pointer;
+    min-width: 40px; min-height: 40px; border-radius: 10px; }
+  #nav-toggle:hover, #top-new:hover { border-color: var(--n1); color: var(--n1);
+    background: var(--bg-inset); box-shadow: 0 0 18px -6px var(--v1); }
+  #topbrand { letter-spacing: 3px; text-transform: uppercase; font-weight: 800; }
+  #topbrand, #top-new { display: none; }
+  #messages { flex: 1; overflow-y: auto; overscroll-behavior: contain;
+    padding: 20px 0 8px; }
   #mlist { max-width: 760px; margin: 0 auto; padding: 0 24px; }
   .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
   .msg { margin-bottom: 22px; }
-  .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .7px;
-    color: var(--fg-faint); margin-bottom: 6px; }
-  .msg.user .body { background: var(--user-bg); padding: 10px 14px; border-radius: var(--radius);
+  /* Who is talking is a colour before it is a word. */
+  .msg .role { font-size: 10.5px; text-transform: uppercase; letter-spacing: 2px;
+    font-weight: 700; color: var(--fg-faint); margin-bottom: 6px; }
+  .msg.user .role { color: var(--n2); }
+  .msg.assistant .role { color: var(--n1); }
+  .msg.user .body { background: linear-gradient(135deg, var(--user-bg), var(--bg-inset));
+    border: 2px solid var(--border); padding: 10px 14px;
+    border-radius: var(--radius) var(--radius) 4px var(--radius);
     display: inline-block; max-width: 100%; }
+  .msg .body h1, .msg .body h2, .msg .body h3 { color: var(--head); letter-spacing: -.2px; }
+  .msg .body strong { color: var(--head); }
   .msg .body { overflow-wrap: anywhere; }
   .msg .body > *:first-child { margin-top: 0; }
   .msg .body > *:last-child { margin-bottom: 0; }
-  .msg img.gen { max-width: 100%; border-radius: var(--radius); border: 1px solid var(--border);
-    display: block; margin-top: 4px; }
-  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px;
-    overflow-x: auto; font-size: 13px; border: 1px solid var(--border); }
-  code { background: var(--code-bg); padding: 1.5px 5px; border-radius: 4px;
-    font-size: .9em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .msg img.gen { max-width: 100%; border-radius: var(--radius); border: 2px solid var(--n2);
+    display: block; margin-top: 4px; box-shadow: 0 0 28px -10px var(--v2); }
+  /* Code is a terminal chip in both themes, so it brings its own foreground
+     rather than inheriting a page colour that is dark on one of them. */
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 12px 14px;
+    border-radius: 8px; overflow-x: auto; font-size: 13px; border: 2px solid var(--n3);
+    box-shadow: 0 0 26px -12px var(--v3); }
+  code { background: var(--code-bg); color: var(--code-fg); padding: 1.5px 5px;
+    border-radius: 4px; font-size: .9em; font-family: var(--mono); }
   pre code { background: none; padding: 0; font-size: inherit; }
   details.think { margin-bottom: 8px; font-size: 13.5px; color: var(--fg-dim);
-    border-left: 2px solid var(--border); padding-left: 10px; }
-  details.think summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
-    text-transform: uppercase; letter-spacing: .6px; }
+    border-left: 3px dashed var(--n4); padding-left: 10px; }
+  details.think summary { cursor: pointer; color: var(--n4); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 2px; font-family: var(--mono); }
   details.think .think-body { white-space: pre-wrap; margin-top: 6px; }
-  .stats { font-size: 11.5px; color: var(--fg-faint); margin-top: 6px;
-    font-variant-numeric: tabular-nums; }
-  .notice { font-size: 13px; color: var(--fg-dim); font-style: italic; }
+  .stats { font-size: 10.5px; color: var(--fg-faint); margin-top: 8px;
+    font-variant-numeric: tabular-nums; text-transform: uppercase; letter-spacing: 1.2px; }
+  .notice { font-size: 13px; color: var(--n2); font-style: italic; }
   details.sources { margin-bottom: 8px; font-size: 13px; }
-  details.sources summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
-    user-select: none; }
+  details.sources summary { cursor: pointer; color: var(--n2); font-size: 11px;
+    user-select: none; font-family: var(--mono); text-transform: uppercase;
+    letter-spacing: 1.6px; }
   details.sources ol { margin: 6px 0 0; padding-left: 22px; }
   details.sources li { margin: 3px 0; }
   details.sources a { color: var(--fg-dim); text-decoration: none; word-break: break-all; }
   details.sources a:hover { text-decoration: underline; }
   details.sources .src-url { display: block; font-size: 11px; color: var(--fg-faint); }
-  .msg.tool .body { color: var(--fg-faint); font-size: 12.5px; font-style: italic; }
-  .err { color: var(--danger); font-size: 13.5px; }
-  .empty { text-align: center; color: var(--fg-faint); margin-top: 18vh; }
-  .empty h1 { font-size: 22px; font-weight: 600; color: var(--fg-dim); margin-bottom: 6px; }
-  .empty p { font-size: 13.5px; }
-  .empty code { font-size: 12.5px; }
-  progress { width: 100%; height: 5px; margin-top: 6px; }
+  .msg.tool .body { color: var(--n4); font-size: 12.5px; font-style: italic; }
+  .err { color: var(--danger); font-size: 13.5px; font-weight: 600; }
+  .empty { text-align: center; color: var(--fg-faint); margin-top: 16vh; }
+  .empty h1 { font-size: 46px; font-weight: 900; letter-spacing: 8px;
+    text-transform: uppercase; margin-bottom: 10px; }
+  .empty p { font-size: 12.5px; letter-spacing: .4px; }
+  .empty code { font-size: 12px; }
+  progress { width: 100%; height: 7px; margin-top: 6px; border-radius: 4px;
+    overflow: hidden; }
+  progress::-webkit-progress-bar { background: var(--bg-inset); border-radius: 4px; }
+  progress::-webkit-progress-value {
+    background: linear-gradient(90deg, var(--v1), var(--v4), var(--v2)); }
 
   /* ---------- composer ---------- */
-  #composer { border-top: 1px solid var(--border); background: var(--bg); padding: 14px 0 18px; }
+  /* Frosted rather than opaque, so the lamps behind the page carry on under
+     it instead of stopping at a grey bar. */
+  #composer { position: relative; background: var(--glass);
+    -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+    padding: 14px 0 18px; }
+  /* The rule above the composer is a moving rainbow. It is the one piece of
+     the page that is doing nothing but being pleased with itself. */
+  #composer::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, var(--v1), var(--v2), var(--v3), var(--v4), var(--v1));
+    background-size: 200% 100%; animation: drift 9s linear infinite;
+  }
+  @keyframes drift { to { background-position: -200% 0; } }
   #composer .wrap { display: flex; flex-direction: column; gap: 8px; }
   #inputrow { display: flex; gap: 8px; align-items: flex-end;
-    border: 1px solid var(--border); border-radius: 12px; padding: 8px 8px 8px 12px;
-    background: var(--bg-alt); }
-  #inputrow:focus-within { border-color: var(--accent); }
+    border: 2px solid var(--border); border-radius: 14px; padding: 8px 8px 8px 12px;
+    background: var(--bg-alt); transition: box-shadow .15s ease, border-color .15s ease; }
+  #inputrow:focus-within { border-color: var(--n2);
+    box-shadow: 0 0 0 3px var(--wash-2), 0 0 30px -8px var(--v2); }
   #input { flex: 1; border: none; background: none; color: var(--fg); font: inherit;
     resize: none; outline: none; max-height: 200px; padding: 4px 0; }
-  #send, #stop { border: none; color: var(--accent-fg); font: inherit;
-    font-weight: 600; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
-  #send { background: var(--accent); }
-  #stop { background: var(--danger); color: #fff; }
+  #input::placeholder { color: var(--fg-faint); }
+  /* Dark ink on every one of these, whatever the theme: the gradient runs
+     through amber, and nothing light survives that. */
+  #send, #stop { border: none; color: var(--btn-ink); font: inherit;
+    font-weight: 800; text-transform: uppercase; letter-spacing: 1.6px; font-size: 13px;
+    padding: 9px 18px; border-radius: 10px; cursor: pointer; }
+  #send { background: linear-gradient(115deg, var(--v1), var(--v4) 55%, var(--v2));
+    box-shadow: 0 6px 22px -8px var(--v1); }
+  #send:hover { filter: brightness(1.1) saturate(1.25); }
+  #send:active { transform: translateY(1px); }
+  #stop { background: var(--danger); color: var(--bg);
+    box-shadow: 0 6px 22px -8px var(--danger); }
   /* ---------- slash menu ---------- */
-  #slash { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-alt);
-    overflow: hidden; }
-  .slash-row { display: flex; gap: 12px; align-items: baseline; padding: 6px 12px;
+  #slash { border: 2px solid var(--n3); border-radius: 12px; background: var(--bg-alt);
+    overflow: hidden; box-shadow: 0 0 30px -12px var(--v3); }
+  .slash-row { display: flex; gap: 12px; align-items: baseline; padding: 7px 12px;
     cursor: pointer; font-size: 13px; }
-  .slash-row:hover { background: var(--bg-inset); }
+  .slash-row:hover { background: linear-gradient(90deg, var(--bg-inset), transparent); }
   .slash-row code { background: none; padding: 0; color: var(--accent);
-    font-size: 12.5px; min-width: 172px; }
+    font-size: 12.5px; min-width: 172px; font-weight: 700; }
   .slash-row span { color: var(--fg-dim); }
-  #toolbar { display: flex; gap: 14px; align-items: center; font-size: 12.5px; color: var(--fg-dim); }
+  #toolbar { display: flex; gap: 14px; align-items: center; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1.2px; color: var(--fg-dim); }
   #toolbar label { display: flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
-  .hint { margin-left: auto; color: var(--fg-faint); }
+  #toolbar label:hover { color: var(--n2); }
+  .hint { margin-left: auto; color: var(--fg-faint); letter-spacing: .6px; }
 
   /* ---------- attachments ---------- */
   #attachments { display: flex; gap: 8px; flex-wrap: wrap; }
   #attachments:empty { display: none; }
   .thumb { position: relative; width: 56px; height: 56px; border-radius: 8px;
-    overflow: hidden; border: 1px solid var(--border); background: var(--bg-inset); }
+    overflow: hidden; border: 2px solid var(--n4); background: var(--bg-inset); }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .thumb .x { position: absolute; top: 1px; right: 1px; width: 17px; height: 17px;
     border: none; border-radius: 50%; background: rgba(0,0,0,.66); color: #fff;
     font-size: 12px; line-height: 17px; padding: 0; cursor: pointer; }
   .thumb .x:hover { background: var(--danger); }
   #attach-btn { border: none; background: none; color: var(--fg-dim); cursor: pointer;
-    font-size: 17px; padding: 4px 6px; border-radius: 6px; line-height: 1; }
-  #attach-btn:hover { background: var(--bg-inset); color: var(--fg); }
-  #strengthrow { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
-    color: var(--fg-dim); }
+    font-size: 17px; padding: 4px 6px; border-radius: 6px; line-height: 1;
+    transition: transform .15s ease; }
+  #attach-btn:hover { background: var(--bg-inset); color: var(--n4); transform: rotate(-14deg); }
+  #strengthrow { display: flex; align-items: center; gap: 8px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1.2px; color: var(--fg-dim); }
   #strengthrow input[type=range] { flex: 1; max-width: 190px; }
-  body.dragging #messages { outline: 2px dashed var(--accent); outline-offset: -10px; }
+  body.dragging #messages { outline: 3px dashed var(--n3); outline-offset: -10px; }
   .msg .atts { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
-  .msg .atts img { max-height: 150px; border-radius: 8px; border: 1px solid var(--border); }
+  .msg .atts img { max-height: 150px; border-radius: 8px; border: 2px solid var(--n4); }
   .imgactions { margin-top: 6px; }
-  .imgactions button { font: inherit; font-size: 12px; padding: 3px 9px; cursor: pointer;
-    border: 1px solid var(--border); background: var(--bg-alt); color: var(--fg-dim);
-    border-radius: 6px; }
-  .imgactions button:hover { border-color: var(--accent); color: var(--accent); }
+  .imgactions button { font: inherit; font-size: 10.5px; padding: 4px 10px; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 1.2px; font-weight: 700;
+    border: 2px solid var(--border); background: none; color: var(--fg-dim);
+    border-radius: 8px; }
+  .imgactions button:hover { border-color: var(--n2); color: var(--n2);
+    box-shadow: 0 0 18px -6px var(--v2); }
+
+  /* ---------- narrow screens ---------- */
+  /* 860px is the one number that matters here: it is also the width the
+     `narrow` signal is initialised and re-tested against, so what CSS calls a
+     drawer and what the page calls a phone stay the same thing. */
+  @media (max-width: 860px) {
+    #sidebar {
+      position: fixed; top: 0; bottom: 0; left: 0; z-index: 30;
+      width: min(84vw, 300px); flex-basis: auto;
+      transform: translateX(-100%); visibility: hidden;
+      transition: transform .2s ease, visibility .2s;
+    }
+    /* Overrides the wide rule: off-screen, not gone, so it can slide. */
+    #sidebar.closed { display: flex; }
+    #sidebar.open { transform: none; visibility: visible;
+      box-shadow: 6px 0 40px -6px var(--v1); }
+    #sidebar.open ~ #scrim { display: block; }
+
+    #topbar { border-bottom: 2px solid var(--border); background: var(--glass);
+      -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+      padding: max(4px, env(safe-area-inset-top)) 6px 4px; }
+    #topbrand { display: block; flex: 1; font-size: 15px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #top-new { display: block; font-size: 21px; }
+
+    #messages { padding-top: 14px; }
+    #mlist, .wrap { padding: 0 14px; }
+    .msg { margin-bottom: 18px; }
+    .empty { margin-top: 10vh; }
+    .empty h1 { font-size: 34px; letter-spacing: 5px; }
+    /* A row that is a fixed-width column plus prose does not fit; stack it. */
+    .slash-row { flex-direction: column; gap: 2px; padding: 9px 12px; }
+    .slash-row code { min-width: 0; }
+    /* Anything under 16px makes iOS zoom the page on focus and never zoom back. */
+    #input { font-size: 16px; }
+    #send, #stop { padding: 10px 18px; }
+    #attach-btn { font-size: 20px; padding: 6px 8px; }
+    .thread { padding: 11px 10px; font-size: 14.5px; }
+    .thread .del { font-size: 19px; padding: 0 6px; }
+    #search { font-size: 16px; }
+    /* Keyboard etiquette on a device with no keyboard. */
+    .hint { display: none; }
+    #toolbar { flex-wrap: wrap; gap: 10px 16px; }
+    #composer { padding: 10px 0 max(10px, env(safe-area-inset-bottom)); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 
-<body data-signals="{thread: '', draft: '', search: '', imgmode: false, think: false, web: false, searchOn: false, searchTip: '', strength: 0.6, atts: [], files: [], _slash: []}">
+<!-- `nav` starts closed on a phone and open on a desktop, which is the only
+     thing the page decides for itself rather than being told. `narrow` holds
+     that verdict so the rest of the page can ask about it cheaply, and the
+     resize handler only touches `nav` when the breakpoint is actually
+     crossed - rotating a phone must not slam the drawer shut, and a pane
+     someone deliberately collapsed must stay collapsed. -->
+<body data-signals="{thread: '', draft: '', search: '', imgmode: false, think: false, web: false, searchOn: false, searchTip: '', strength: 0.6, atts: [], files: [], _slash: [], nav: window.innerWidth > 860, narrow: window.innerWidth &lt;= 860, touch: matchMedia('(pointer: coarse)').matches}"
+      data-on:resize__window__debounce.200ms="(window.innerWidth &lt;= 860) !== $narrow
+        &amp;&amp; ($narrow = !$narrow, $nav = !$narrow)"
+      data-on:keydown__window="evt.key === 'Escape' &amp;&amp; $narrow &amp;&amp; ($nav = false)">
 
-<aside id="sidebar">
+<!-- Picking a conversation on a phone means you are done with the drawer.
+     The listener sits here rather than on the rows because the rows are
+     replaced by the server on every patch, and this element never is. The
+     delete button stops propagation, so it does not close anything. -->
+<aside id="sidebar" data-class="{open: $nav, closed: !$nav}"
+       data-on:click="$narrow &amp;&amp; evt.target.closest('.thread') &amp;&amp; ($nav = false)">
   <div id="brand"><span class="dot" id="dot"></span> hearth</div>
 
-  <button id="new-btn" data-on:click="@post('/ui/new')">+ New conversation</button>
+  <button id="new-btn" data-on:click="(@post('/ui/new'), $narrow &amp;&amp; ($nav = false))">+ New conversation</button>
 
   <!-- Filtering happens in SQL-adjacent Python, not here: typing patches the
        `search` signal, which is sent along and comes back as a new list. -->
@@ -208,7 +439,19 @@
        data-on-interval__duration.4s.leading="@get('/ui/status', {filterSignals: {exclude: /./}})">connecting...</div>
 </aside>
 
+<!-- Sibling of the drawer, and shown by CSS when the drawer is open, so it
+     needs no signal of its own and cannot flash before Datastar has run. -->
+<div id="scrim" data-on:click="$nav = false"></div>
+
 <main id="main">
+  <div id="topbar">
+    <button id="nav-toggle" aria-label="Conversations" title="Conversations"
+            data-on:click="$nav = !$nav">&#9776;</button>
+    <span id="topbrand">hearth</span>
+    <button id="top-new" aria-label="New conversation" title="New conversation"
+            data-on:click="@post('/ui/new')">+</button>
+  </div>
+
   <div id="messages"><div id="mlist"></div></div>
 
   <div id="composer">
@@ -236,7 +479,8 @@
           data-ref:_input
           data-on:keydown="evt.key === 'Tab' &amp;&amp; $_slashMatch.length === 1
               ? (evt.preventDefault(), $draft = $_slashMatch[0] + ' ')
-              : evt.key === 'Enter' &amp;&amp; !evt.shiftKey &amp;&amp; (evt.preventDefault(), $_send.click())"></textarea>
+              : evt.key === 'Enter' &amp;&amp; !evt.shiftKey &amp;&amp; !$touch
+                &amp;&amp; (evt.preventDefault(), $_send.click())"></textarea>
 
         <!-- One request, one indicator. Enter presses this button rather than
              posting on its own, so `sending` covers both ways of sending. -->
@@ -276,7 +520,7 @@
 
 <script>
 // What is left after Datastar: two things the browser exposes no declarative
-// hook for, and one piece of scroll etiquette.
+// hook for, one piece of scroll etiquette, and one manner.
 
 // 1. Files from a drop or a paste. Datastar understands <input type=file>, so
 //    hand it the files and let data-bind do the encoding.
@@ -333,7 +577,9 @@ box.addEventListener("scroll", () => {
 new MutationObserver(() => { if (pinned) box.scrollTop = box.scrollHeight; })
   .observe(box, { childList: true, subtree: true, characterData: true });
 
-input.focus();
+// 4. Focus on load, but not on a touch keyboard: it would throw up the
+//    on-screen keyboard over the conversation before anything was read.
+if (!matchMedia("(pointer: coarse)").matches) input.focus();
 </script>
 </body>
 </html>
