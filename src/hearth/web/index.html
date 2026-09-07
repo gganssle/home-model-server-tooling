@@ -212,8 +212,12 @@
   <div id="messages"><div id="mlist"></div></div>
 
   <div id="composer">
+    <!-- Kebab-case in the key, camelCase in the signal: HTML lowercases
+         attribute names, so `_slashMatch` here would silently define
+         `_slashmatch` and every `$_slashMatch` below would read an undefined
+         signal. Datastar converts `-x` to `X` for exactly this reason. -->
     <div class="wrap"
-      data-computed:_slashMatch="$draft.startsWith('/') &amp;&amp; !$draft.includes(' ')
+      data-computed:_slash-match="$draft.startsWith('/') &amp;&amp; !$draft.includes(' ')
         ? $_slash.filter((c) =&gt; c.startsWith($draft.toLowerCase())) : []">
       <div id="attachments"></div>
 

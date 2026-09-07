@@ -62,6 +62,39 @@ for (const [, name, , value] of attrs) {
   }
 }
 
+// Every `$signal` an expression reads has to be one the page actually
+// defines. HTML lowercases attribute names, so `data-computed:fooBar` quietly
+// declares `foobar` while `$fooBar` reads an undefined signal - the menu was
+// invisible for exactly this reason, and nothing else here noticed.
+const camel = (k) => k.replace(/-[a-z]/g, (m) => m[1].toUpperCase());
+const declared = new Set();
+// Declared by a keyed attribute: the key is the signal name, after Datastar's
+// kebab-to-camel conversion.
+for (const [, name, key] of html.matchAll(/\sdata-(bind|ref|indicator|computed)((?::|__)[^=\s>]*)?/g)) {
+  // `.toLowerCase()` is the whole point: it is what the HTML parser does to an
+  // attribute name, and reading the source without it makes this check pass on
+  // exactly the bug it exists to find.
+  if (key) declared.add(camel(key.replace(/^:/, '').split('__')[0].toLowerCase()));
+}
+// Declared in a `data-signals` object literal, where case is preserved because
+// it is JavaScript rather than an attribute name.
+for (const [, body] of html.matchAll(/data-signals="([^"]*)"/g)) {
+  for (const [, key] of body.matchAll(/([A-Za-z_][\w]*)\s*:/g)) declared.add(key);
+}
+// Patched in by the server rather than declared in the page.
+for (const key of ['searchOn', 'searchTip', '_slash']) declared.add(key);
+
+const referenced = new Set();
+for (const [, name, , value] of attrs) {
+  if (value === undefined || !EXPRESSIONS.has(name)) continue;
+  for (const [, sig] of decode(value).matchAll(/\$([A-Za-z_][\w]*)/g)) referenced.add(sig);
+}
+check('the page references at least a few signals', referenced.size > 5, [...referenced].join(' '));
+for (const sig of [...referenced].sort()) {
+  check(`$${sig} is defined somewhere`, declared.has(sig),
+        `declared: ${[...declared].sort().join(' ')}`);
+}
+
 // Attributes that only exist in the page as bare names still have to be real.
 for (const name of ['bind', 'ref', 'indicator']) {
   check(`data-${name} is used and supported`, seen.has(name) && plugins.has(name));
