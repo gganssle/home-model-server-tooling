@@ -426,7 +426,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 `/v1/models` and both streaming and non-streaming `/v1/chat/completions` are
-implemented, including multimodal `image_url` content parts.
+implemented, including multimodal `image_url` content parts and OpenAI-compatible
+function tool calls. Clients can send `tools` and return `role: "tool"` results;
+Hearth translates between that protocol and Qwen's native tool-call syntax.
 
 ## Reaching it over SSH
 

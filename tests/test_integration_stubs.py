@@ -71,7 +71,23 @@ def fake_text_stream(self, messages, images=None, max_tokens=None, temperature=N
     self.model = object()  # pretend we loaded
     images = images or []
     last, markers, sources = _describe(messages)
+    tool_results = [m for m in messages if m.get("role") == "tool"]
     yield {"type": "start", "thinking_open": False}
+
+    if tools and "RUN_TOOL" in last and not tool_results:
+        name = tools[0]["function"]["name"]
+        for piece in ["I'll run it. <tool", f"_call>\n<function={name}>\n",
+                      "<parameter=command>\npwd\n</parameter>\n",
+                      "<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>"]:
+            yield {"type": "token", "text": piece}
+        yield {"type": "done", "text": "", "meta": {"model": "stub"}}
+        return
+
+    if "RUN_TOOL" in last and tool_results:
+        reply = f"tool returned: {tool_results[-1].get('content')}"
+        yield {"type": "token", "text": reply}
+        yield {"type": "done", "text": reply, "meta": {"model": "stub"}}
+        return
 
     if tools and "LOOKUP" in last and not sources:
         for piece in ["let me check. ", '<tool_call>{"name": "web_search", ',
@@ -155,4 +171,3 @@ def fake_image_stream(self, prompt, negative_prompt=None, width=None, height=Non
         meta["from_image"] = Path(init_image).name
         meta["image_strength"] = image_strength
     yield {"type": "done", "image": filename, "meta": meta}
-

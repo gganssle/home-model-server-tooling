@@ -12,12 +12,20 @@ back.
 from __future__ import annotations
 
 import json
+import re
 
 OPEN = "<think>"
 CLOSE = "</think>"
 
 TOOL_OPEN = "<tool_call>"
 TOOL_CLOSE = "</tool_call>"
+
+_FUNCTION_CALL = re.compile(
+    r"^\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*$", re.DOTALL
+)
+_FUNCTION_PARAMETER = re.compile(
+    r"<parameter=([^>\n]+)>(.*?)</parameter>", re.DOTALL
+)
 
 
 class ThinkSplitter:
@@ -95,7 +103,7 @@ def _partial_suffix_len(buf: str, tag: str) -> int:
 
 
 class ToolCallSplitter:
-    """Pull `<tool_call>{...}</tool_call>` blocks out of a token stream.
+    """Pull Qwen `<tool_call>...</tool_call>` blocks out of a token stream.
 
     Sits downstream of `ThinkSplitter`: reasoning is separated first, and only
     the content channel is scanned for calls. Visible text comes back out; the
@@ -161,7 +169,7 @@ class ToolCallSplitter:
                 self.visible.append(self._buf)
             self._buf = ""
         if self._in_call:
-            # An unterminated call means the model ran out of tokens mid-JSON.
+            # An unterminated call means the model ran out of tokens mid-payload.
             # Salvage it if it parses; otherwise drop it rather than showing
             # the user a half-written function call.
             self._finish_call()
@@ -172,16 +180,38 @@ class ToolCallSplitter:
         raw, self._current = self._current.strip(), ""
         if not raw:
             return
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            return
-        if isinstance(payload, dict):
+        payload = parse_tool_call(raw)
+        if payload is not None:
             self.calls.append(payload)
 
     @property
     def visible_text(self) -> str:
         return "".join(self.visible)
+
+
+def parse_tool_call(raw: str) -> dict | None:
+    """Parse the JSON and XML-like native formats used by Qwen models."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+
+    match = _FUNCTION_CALL.fullmatch(raw)
+    if not match:
+        return None
+    arguments: dict[str, object] = {}
+    for parameter in _FUNCTION_PARAMETER.finditer(match.group(2)):
+        name, value = parameter.group(1).strip(), parameter.group(2)
+        if not name:
+            continue
+        if value.startswith("\n"):
+            value = value[1:]
+        if value.endswith("\n"):
+            value = value[:-1]
+        arguments[name] = value
+    return {"name": match.group(1).strip(), "arguments": arguments}
 
 
 def tool_call_query(call: dict) -> str | None:
