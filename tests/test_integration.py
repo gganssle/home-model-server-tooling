@@ -394,6 +394,29 @@ try:
     answer = "".join(e["text"] for e in events
                      if e["type"] == "token" and e.get("channel") != "thinking")
     check("a follow-up triggers no new search", len(provider.queries) == before)
+
+    # `/web off` in the REPL is sticky for the session, so the next explicit
+    # `/web <query>` arrives with search=False. The verb has to win, or the
+    # lookup the user just typed is silently dropped.
+    before = len(provider.queries)
+    stid = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    forced = sse_events(sclient.post(
+        f"/api/threads/{stid}/messages",
+        json={"content": "/web mlx release notes", "search": False},
+    ))
+    check("/web outranks a standing search=False",
+          [e["phase"] for e in forced if e["type"] == "search"][:1] == ["querying"],
+          str([e for e in forced if e["type"] == "search"][:2]))
+    check("and it really did query the provider", len(provider.queries) > before)
+
+    # The plain suppression it is meant to leave alone.
+    before = len(provider.queries)
+    sse_events(sclient.post(
+        f"/api/threads/{stid}/messages",
+        json={"content": "tell me about mlx", "search": False},
+    ))
+    check("search=False still suppresses an ordinary message",
+          len(provider.queries) == before)
     check("the follow-up still sees the stored sources",
           "from 1 source block(s)" in answer, answer)
 

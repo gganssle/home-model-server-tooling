@@ -581,10 +581,15 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         _autotitle(thread.id, forced_query or text or "image")
 
         # Three ways a turn can end up searching, in descending order of how
-        # much the user meant it.
-        if search is False:
+        # much the user meant it. `/web <query>` is checked first because it is
+        # the most deliberate signal there is: typing the verb outranks a
+        # standing "off", which is otherwise sticky for a whole REPL session
+        # and silently swallowed the lookup that was just asked for.
+        if forced_query is not None:
+            want_search, search_why = True, "asked for with /web"
+        elif search is False:
             want_search, search_why = False, "suppressed for this message"
-        elif forced_query is not None or search:
+        elif search:
             want_search, search_why = True, "requested"
         else:
             want_search, search_why = websearch.wants_search(text)

@@ -269,6 +269,14 @@ def main() -> int:
         check("with /web off an ordinary message does not search",
               "searching the web" not in repl.buf, repr(repl.buf[-400:]))
 
+        # ...but an explicit /web still must. The mode is sticky for the whole
+        # session, so this is the state a user is most likely to type the verb
+        # in, and the lookup used to vanish without a word.
+        repl.buf = ""
+        repl.send("/web what changed in mlx")
+        check("/web searches even with web search off",
+              repl.read_until("searching the web"), repr(repl.buf[-400:]))
+
         repl.buf = ""
         repl.send("/status")
         check("/status reports memory", repl.read_until("memory"), repr(repl.buf[-300:]))
