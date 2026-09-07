@@ -4,8 +4,9 @@ set -u
 cd "$(dirname "$0")"
 PY=./.venv/bin/python
 fail=0
-for t in tests/test_search.py tests/test_integration.py tests/test_cli.py \
-         tests/test_concurrency.py tests/test_repl.py; do
+for t in tests/test_search.py tests/test_integration.py tests/test_webui.py \
+         tests/test_markdown.py tests/test_cli.py tests/test_concurrency.py \
+         tests/test_repl.py; do
   echo "=============================================="
   echo "  $t"
   echo "=============================================="
@@ -13,11 +14,11 @@ for t in tests/test_search.py tests/test_integration.py tests/test_cli.py \
 done
 if command -v node >/dev/null 2>&1; then
   echo "=============================================="
-  echo "  tests/web/md.test.js"
+  echo "  tests/web/datastar.test.js"
   echo "=============================================="
   ./tests/web/run.sh || fail=1
 else
-  echo "(skipping web UI tests: node not found)"
+  echo "(skipping the Datastar attribute check: node not found)"
 fi
 
 echo

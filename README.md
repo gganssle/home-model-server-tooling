@@ -490,7 +490,9 @@ and a fixture web server on an ephemeral loopback port.
 | `test_cli.py` | every CLI command against a live server, including pipe behaviour |
 | `test_concurrency.py` | cancellation mid-generation and mid-fetch, request queueing, unloading |
 | `test_repl.py` | the interactive REPL, driven through a real pty |
-| `web/md.test.js` | the UI's markdown renderer and its HTML escaping |
+| `test_webui.py` | the web UI's routes: which Datastar frames each gesture produces, and what markup they carry |
+| `test_markdown.py` | the Markdown subset, its HTML escaping, and source-link defusing |
+| `web/datastar.test.js` | every `data-*` attribute in the page, checked against the runtime vendored beside it |
 
 Once the weights are downloaded, there is also a smoke test against the real
 models — text, multi-turn context, reasoning, and image generation:
@@ -518,5 +520,56 @@ src/hearth/
   server.py       FastAPI: thread API, SSE, OpenAI shim
   client.py       HTTP client used by the CLI
   cli.py          commands and the interactive REPL
-  web/index.html  the web UI (single file, no build step)
+  search/         web search: providers, fetching, budgeting
+  datastar.py     the two SSE frame types the browser understands
+  mdrender.py     Markdown -> HTML, a small deliberate subset
+  render.py       server-rendered HTML fragments for the web UI
+  webui.py        the browser's routes: HTML and patches, not JSON
+  web/index.html  the page: signals and URLs, no build step
+  web/datastar.js the Datastar runtime, vendored (v1.0.3)
 ```
+
+## The web UI
+
+The browser frontend is [Datastar](https://data-star.dev/). There is no build
+step, no framework, and almost no JavaScript: the page declares a handful of
+signals and says which URL each gesture asks, and the server answers with the
+HTML that should now be on screen.
+
+```html
+<input data-bind:search
+       data-on:input__debounce.200ms="@get('/ui/threads')">
+```
+
+That is the entire search box. Typing updates the `search` signal, the signal
+travels with the request, and `/ui/threads` returns a new `<div id="threads">`
+that Datastar morphs into place.
+
+Updates arrive as ordinary SSE. Two event types cover everything:
+
+```
+event: datastar-patch-elements
+data: selector #mlist
+data: mode append
+data: elements <div class="msg user">...</div>
+
+event: datastar-patch-signals
+data: signals {"draft":"","atts":[]}
+```
+
+So a generation is one long response. The assistant's bubble is appended once
+as a set of named, empty slots, and the reasoning block, sources strip,
+progress bar, body and status line are then patched individually as events
+arrive — coalesced to about fifteen frames a second, since re-rendering
+Markdown per token is wasteful. When the turn ends the placeholder is replaced
+by the *stored* message, which is byte-for-byte what a page reload would
+render, so there is never a live version and a saved version to keep in step.
+A turn that searched re-renders the whole transcript instead, because
+retrieval inserts a `tool` message between the question and the answer.
+
+The runtime is served from `/datastar.js` rather than a CDN, so the UI still
+works with the network off.
+
+The JSON API under `/api` is untouched by any of this — it is what the CLI, the
+REPL and the OpenAI shim speak, and both frontends share one turn pipeline in
+`server.py`, so they cannot drift apart.

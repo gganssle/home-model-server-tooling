@@ -17,24 +17,23 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import iterate_in_threadpool
 
 from hearth import config as config_mod
+from hearth import webui
 from hearth.engine import ModelManager
 from hearth.search import TOOL_SCHEMA, Outcome, WebSearch
 from hearth.search import budget as search_budget
-from hearth.store import Store
+from hearth.store import Message, Store
 from hearth.textutil import ThinkSplitter, ToolCallSplitter, tool_call_query
 
 log = logging.getLogger("hearth.server")
 
-WEB_DIR = Path(__file__).parent / "web"
-IMAGE_PREFIX = "/image "
 
 _EXT_BY_MIME = {
     "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
@@ -63,6 +62,13 @@ def sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
+class Turn(NamedTuple):
+    """A stored user message and the not-yet-started stream it will answer."""
+
+    user: Message
+    events: Callable[[], Iterator[dict[str, Any]]]
+
+
 class NewThread(BaseModel):
     title: str = "New conversation"
 
@@ -84,6 +90,9 @@ class ChatRequest(BaseModel):
     # True forces a web search for this turn, False suppresses one that would
     # otherwise be automatic, None leaves the decision to the configured policy.
     search: bool | None = None
+    # Only meaningful with a leading `/edit`, where it says how far from the
+    # base image to stray. Mirrors the field on ImageRequest.
+    image_strength: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ImageRequest(BaseModel):
@@ -427,6 +436,9 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         streamed as they happen rather than arriving in a lump at the end;
         exactly the shape Job already uses for the engines. Returns the Outcome
         via `yield from`.
+
+        Yields plain event dicts. Encoding them is the caller's business: the
+        JSON API forwards them as-is, the web UI turns them into HTML patches.
         """
         events: queue.Queue = queue.Queue()
         box: dict[str, Any] = {}
@@ -449,12 +461,12 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
             event = events.get()
             if event is None:
                 break
-            yield sse(event)
+            yield event
         worker.join()
 
         outcome: Outcome = box["outcome"]
         if box.get("crashed"):
-            yield sse({"type": "search", "phase": "error", "error": outcome.error})
+            yield {"type": "search", "phase": "error", "error": outcome.error}
 
         # Stored even when it failed or was cancelled: the transcript should say
         # that a lookup was attempted, and the compact line is what says it.
@@ -469,7 +481,9 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
             title = " ".join(first_message.split())[:60]
             store.rename_thread(thread_id, title or "New conversation")
 
-    def _image_stream(req: ImageRequest, thread_id: str | None) -> Iterator[str]:
+    def _image_events(
+        req: ImageRequest, thread_id: str | None
+    ) -> Iterator[dict[str, Any]]:
         """Shared by POST /api/images and the `/image ...` chat shortcut."""
         init_image = _resolve_image_ref(req.init_image) if req.init_image else None
         job = manager.submit_image(
@@ -494,13 +508,31 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     event["message_id"] = msg.id
                 event["meta"] = meta
                 event["url"] = f"/api/images/{event['image']}"
-            yield sse(event)
+            yield event
 
-    @app.post("/api/threads/{ref}/messages")
-    async def post_message(ref: str, body: ChatRequest, request: Request):
-        thread = _resolve(ref)
-        text = body.content.strip()
-        if not text and not body.images:
+    def prepare_turn(
+        thread,
+        content: str,
+        images: list[str] | None = None,
+        *,
+        thinking: bool | None = None,
+        search: bool | None = None,
+        image_strength: float | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> Turn:
+        """Store the user's turn and hand back the events it will produce.
+
+        Split this way so the two frontends can share one pipeline: everything
+        that can fail - an empty message, an unreadable attachment, `/edit`
+        with nothing to edit, a bare `/web` - happens here, while the response
+        is still a plain 400, and only the streaming half is left to the
+        caller. The web UI renders those events as HTML patches, the JSON API
+        forwards them as-is.
+        """
+        images = list(images or [])
+        text = content.strip()
+        if not text and not images:
             raise HTTPException(400, "empty message")
 
         # A leading `/image` or `/edit` turns the single chat box into an image
@@ -517,7 +549,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                 # Edit whatever was just attached, else the newest image in the
                 # thread - which is what "make the sky stormier" ought to mean.
                 init_image = (
-                    _materialize_images(body.images)[0] if body.images
+                    _materialize_images(images)[0] if images
                     else _latest_image(thread.id)
                 )
                 if init_image is None:
@@ -525,14 +557,12 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                         400, "/edit needs an image: attach one, or generate one first"
                     )
 
-            store.add_message(thread.id, "user", text)
+            user = store.add_message(thread.id, "user", text)
             _autotitle(thread.id, prompt)
-            return StreamingResponse(
-                iterate_in_threadpool(_image_stream(
-                    ImageRequest(prompt=prompt, init_image=init_image), thread.id
-                )),
-                media_type="text/event-stream",
+            req = ImageRequest(
+                prompt=prompt, init_image=init_image, image_strength=image_strength
             )
+            return Turn(user, lambda: _image_events(req, thread.id))
 
         # `/web <query>` searches before answering. Routed on the leading verb
         # like /image and /edit, so both frontends behave identically without
@@ -543,8 +573,8 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
             if not forced_query:
                 raise HTTPException(400, "usage: /web <query>")
 
-        attachments = _materialize_images(body.images)
-        store.add_message(
+        attachments = _materialize_images(images)
+        user = store.add_message(
             thread.id, "user", text,
             meta={"images": attachments} if attachments else None,
         )
@@ -552,9 +582,9 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
 
         # Three ways a turn can end up searching, in descending order of how
         # much the user meant it.
-        if body.search is False:
+        if search is False:
             want_search, search_why = False, "suppressed for this message"
-        elif forced_query is not None or body.search:
+        elif forced_query is not None or search:
             want_search, search_why = True, "requested"
         else:
             want_search, search_why = websearch.wants_search(text)
@@ -568,10 +598,10 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         offer_tools = (
             websearch.enabled
             and cfg.search.autonomous == "tool"
-            and body.search is not False
+            and search is not False
         )
 
-        def gen() -> Iterator[str]:
+        def events() -> Iterator[dict[str, Any]]:
             cancel = threading.Event()
             with search_lock:
                 search_cancels.add(cancel)
@@ -600,23 +630,23 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     meta["cancelled"] = True
                 content = "".join(answer).strip()
                 msg = store.add_message(thread.id, "assistant", content, meta=meta)
-                yield sse({
+                yield {
                     "type": "done",
                     "message_id": msg.id,
                     "content": content,
                     "meta": meta,
                     "cancelled": cancelled,
-                })
+                }
 
-            def emit_token(channel: str, piece: str) -> str:
+            def emit_token(channel: str, piece: str) -> dict[str, Any]:
                 (reasoning if channel == "thinking" else answer).append(piece)
-                return sse({"type": "token", "channel": channel, "text": piece})
+                return {"type": "token", "channel": channel, "text": piece}
 
             try:
                 # ---- retrieval first, before any GPU work is queued ----
                 if want_search and not websearch.enabled:
-                    yield sse({"type": "search", "phase": "error",
-                               "error": websearch.unavailable_reason})
+                    yield {"type": "search", "phase": "error",
+                           "error": websearch.unavailable_reason}
                 elif want_search:
                     log.info("searching (%s): %s", search_why, search_text)
                     outcome = yield from _run_search(
@@ -624,7 +654,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     )
                     sources.extend(outcome.sources())
                     if outcome.cancelled or cancel.is_set():
-                        yield sse({"type": "cancelled"})
+                        yield {"type": "cancelled"}
                         yield from persist({}, True)
                         return
 
@@ -637,9 +667,9 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     job = manager.submit_text(
                         messages=history,
                         images=image_paths,
-                        max_tokens=body.max_tokens,
-                        temperature=body.temperature,
-                        thinking=body.thinking,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        thinking=thinking,
                         tools=[TOOL_SCHEMA] if offer_tools else None,
                     )
 
@@ -666,9 +696,9 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                         elif etype in ("done", "cancelled", "error"):
                             terminal = event
                             if etype != "done":
-                                yield sse(event)
+                                yield event
                         else:
-                            yield sse(event)
+                            yield event
 
                     for channel, piece in think.finish():
                         if channel == "thinking":
@@ -715,8 +745,21 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                 with search_lock:
                     search_cancels.discard(cancel)
 
+        return Turn(user, events)
+
+    @app.post("/api/threads/{ref}/messages")
+    async def post_message(ref: str, body: ChatRequest):
+        turn = prepare_turn(
+            _resolve(ref), body.content, body.images,
+            thinking=body.thinking,
+            search=body.search,
+            image_strength=body.image_strength,
+            max_tokens=body.max_tokens,
+            temperature=body.temperature,
+        )
         return StreamingResponse(
-            iterate_in_threadpool(gen()), media_type="text/event-stream"
+            iterate_in_threadpool(sse(event) for event in turn.events()),
+            media_type="text/event-stream",
         )
 
     # ---------------- images ----------------
@@ -730,7 +773,7 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
             store.add_message(thread_id, "user", f"{verb} {body.prompt}")
             _autotitle(thread_id, body.prompt)
         return StreamingResponse(
-            iterate_in_threadpool(_image_stream(body, thread_id)),
+            iterate_in_threadpool(sse(e) for e in _image_events(body, thread_id)),
             media_type="text/event-stream",
         )
 
@@ -826,9 +869,18 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
 
     # ---------------- web UI ----------------
 
-    @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        return (WEB_DIR / "index.html").read_text()
+    # Everything the browser talks to lives in `webui`: HTML fragments and
+    # Datastar patches rather than JSON. It shares this module's store, model
+    # manager and turn pipeline, so the two frontends can never drift apart.
+    webui.register(app, webui.Backend(
+        cfg=cfg,
+        store=store,
+        manager=manager,
+        websearch=websearch,
+        resolve=_resolve,
+        prepare_turn=prepare_turn,
+        materialize_images=_materialize_images,
+    ))
 
     return app
 
