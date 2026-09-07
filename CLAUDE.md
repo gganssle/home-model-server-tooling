@@ -70,9 +70,10 @@ uv pip install -e .
 ./.venv/bin/python tests/smoke_real.py  # real models; requires `hearth pull` first
 ```
 
-`run_tests.sh` covers the HTTP surface, the CLI (spawned as real subprocesses),
-cancellation and queueing, the REPL under a pty, and the web UI's markdown
-renderer under node.
+`run_tests.sh` covers the HTTP surface, web search against a local fixture, the
+Datastar routes the browser talks to, the Markdown renderer, the CLI (spawned
+as real subprocesses), cancellation and queueing, the REPL under a pty, and the
+page's `data-*` attributes under node.
 
 ## Architecture Overview
 
@@ -94,10 +95,40 @@ src/hearth/
   server.py       FastAPI: thread API, SSE, OpenAI shim
   client.py       HTTP client used by the CLI
   cli.py          commands and the interactive REPL
-  web/index.html  the web UI (single file, no build step)
+  search/         web search: providers, fetching, budgeting
+  datastar.py     the two SSE frame types the browser understands
+  mdrender.py     Markdown -> HTML, a small deliberate subset
+  render.py       server-rendered HTML fragments for the web UI
+  webui.py        the browser's routes: HTML and patches, not JSON
+  web/index.html  the page: signals and URLs, no build step
+  web/datastar.js the Datastar runtime, vendored (v1.0.3)
 ```
 
 ## Conventions & Patterns
+
+**The web UI is Datastar, so it renders on the server.** `web/index.html` holds
+signals and URLs, not logic; every fragment it can display is built by
+`render.py` and delivered as a `datastar-patch-elements` frame. Anything a
+model, a user or a search result wrote is escaped in `render.py` on the way in
+- that is the one module that concatenates untrusted text into markup, which
+is why it is one module.
+
+**`/api` and `/ui` are different audiences, not different features.** `/api`
+speaks JSON to the CLI, the REPL and the OpenAI shim; `/ui` speaks HTML and
+Datastar patches to the browser. They share `prepare_turn` in `server.py`, so a
+change to how a turn works reaches both. Request models under `/api` are strict
+because a misspelled field is a client bug; models under `/ui` ignore extras
+because the page sends its whole signal bag by design.
+
+**Attachments arriving from the browser are confined to the image directory.**
+`atts` is a signal, so it is whatever the page last claimed. The JSON API
+accepts filesystem paths on purpose - the CLI attaches by path - but `webui.py`
+drops the directory part of anything the browser names and requires the file to
+already exist.
+
+**Search availability reaches the page as signals, not markup.** The Web
+control wraps a checkbox, and morphing that element on every status poll would
+fight the box for its own checked state.
 
 **All GPU work runs on one worker thread** (`engine/manager.py`). MLX is not
 safe to run concurrently and two large models racing for unified memory will

@@ -4,6 +4,29 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>hearth</title>
+<!--
+  The whole frontend. There is no build step and almost no JavaScript: the
+  page declares a few signals and says which URL each gesture asks, and the
+  server answers with the HTML that should now be on screen. Every fragment
+  it can send is rendered by `hearth/render.py`; the frames that carry them
+  are described in `hearth/datastar.py`.
+
+  Signals, in full:
+    thread    id of the open conversation, "" for a fresh one
+    draft     the composer's text
+    search    the sidebar filter
+    imgmode   draw instead of chat
+    think     ask for reasoning
+    strength  how far an edit may stray from its base image
+    atts      filenames queued in the composer, already stored server-side
+    files     base64 uploads in flight, emptied the moment they are stored
+    web       force a web search for this turn
+    searchOn  whether a search provider is configured (from /ui/status)
+    searchTip why, when it is not
+    sending   true while a generation request is open (from data-indicator)
+    _send     a reference to the send button, so Enter can press it
+-->
+<script type="module" src="/datastar.js"></script>
 <style>
   :root {
     --bg: #ffffff; --bg-alt: #f6f7f9; --bg-inset: #eceef2;
@@ -59,12 +82,14 @@
     cursor: pointer; font-size: 15px; padding: 0 2px; line-height: 1; }
   .thread:hover .del { opacity: 1; }
   .thread .del:hover { color: var(--danger); }
+  .thread-empty { padding: 8px 10px; font-size: 13px; color: var(--fg-faint); }
   #sysinfo { padding: 10px 16px; border-top: 1px solid var(--border);
     font-size: 11.5px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }
 
   /* ---------- main ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #messages { flex: 1; overflow-y: auto; padding: 28px 0 8px; }
+  #mlist { max-width: 760px; margin: 0 auto; padding: 0 24px; }
   .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
   .msg { margin-bottom: 22px; }
   .msg .role { font-size: 11px; text-transform: uppercase; letter-spacing: .7px;
@@ -86,7 +111,9 @@
   details.think summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
     text-transform: uppercase; letter-spacing: .6px; }
   details.think .think-body { white-space: pre-wrap; margin-top: 6px; }
-
+  .stats { font-size: 11.5px; color: var(--fg-faint); margin-top: 6px;
+    font-variant-numeric: tabular-nums; }
+  .notice { font-size: 13px; color: var(--fg-dim); font-style: italic; }
   details.sources { margin-bottom: 8px; font-size: 13px; }
   details.sources summary { cursor: pointer; color: var(--fg-faint); font-size: 12px;
     user-select: none; }
@@ -96,9 +123,6 @@
   details.sources a:hover { text-decoration: underline; }
   details.sources .src-url { display: block; font-size: 11px; color: var(--fg-faint); }
   .msg.tool .body { color: var(--fg-faint); font-size: 12.5px; font-style: italic; }
-  .stats { font-size: 11.5px; color: var(--fg-faint); margin-top: 6px;
-    font-variant-numeric: tabular-nums; }
-  .notice { font-size: 13px; color: var(--fg-dim); font-style: italic; }
   .err { color: var(--danger); font-size: 13.5px; }
   .empty { text-align: center; color: var(--fg-faint); margin-top: 18vh; }
   .empty h1 { font-size: 22px; font-weight: 600; color: var(--fg-dim); margin-bottom: 6px; }
@@ -115,10 +139,10 @@
   #inputrow:focus-within { border-color: var(--accent); }
   #input { flex: 1; border: none; background: none; color: var(--fg); font: inherit;
     resize: none; outline: none; max-height: 200px; padding: 4px 0; }
-  #send { border: none; background: var(--accent); color: var(--accent-fg); font: inherit;
+  #send, #stop { border: none; color: var(--accent-fg); font: inherit;
     font-weight: 600; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
-  #send:disabled { opacity: .45; cursor: default; }
-  #send.stop { background: var(--danger); color: #fff; }
+  #send { background: var(--accent); }
+  #stop { background: var(--danger); color: #fff; }
   #toolbar { display: flex; gap: 14px; align-items: center; font-size: 12.5px; color: var(--fg-dim); }
   #toolbar label { display: flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
   .hint { margin-left: auto; color: var(--fg-faint); }
@@ -149,599 +173,142 @@
   .imgactions button:hover { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
-<body>
+
+<body data-signals="{thread: '', draft: '', search: '', imgmode: false, think: false, web: false, searchOn: false, searchTip: '', strength: 0.6, atts: [], files: []}">
 
 <aside id="sidebar">
   <div id="brand"><span class="dot" id="dot"></span> hearth</div>
-  <button id="new-btn">+ New conversation</button>
-  <input id="search" placeholder="Search conversations..." autocomplete="off">
-  <div id="threads"></div>
-  <div id="sysinfo">connecting...</div>
+
+  <button id="new-btn" data-on:click="@post('/ui/new')">+ New conversation</button>
+
+  <!-- Filtering happens in SQL-adjacent Python, not here: typing patches the
+       `search` signal, which is sent along and comes back as a new list. -->
+  <input id="search" placeholder="Search conversations..." autocomplete="off"
+         data-bind:search
+         data-on:input__debounce.200ms="@get('/ui/threads', {filterSignals: {include: /^(search|thread)$/}})">
+
+  <div id="threads"
+       data-init="@get('/ui/threads', {filterSignals: {include: /^(search|thread)$/}})"></div>
+
+  <!-- `.leading` fires the first poll immediately instead of four seconds in.
+       The status line needs no signals, so none are sent. -->
+  <div id="sysinfo"
+       data-on-interval__duration.4s.leading="@get('/ui/status', {filterSignals: {exclude: /./}})">connecting...</div>
 </aside>
 
 <main id="main">
-  <div id="messages"><div class="wrap" id="mlist"></div></div>
+  <div id="messages"><div id="mlist"></div></div>
+
   <div id="composer">
     <div class="wrap">
       <div id="attachments"></div>
+
       <div id="inputrow">
-        <button id="attach-btn" title="Attach an image">&#128206;</button>
-        <textarea id="input" rows="1" placeholder="Send a message, or describe an image..."></textarea>
-        <button id="send">Send</button>
+        <button id="attach-btn" title="Attach an image" data-on:click="$_file.click()">&#128206;</button>
+
+        <textarea id="input" rows="1"
+          data-bind:draft
+          data-attr:placeholder="$imgmode
+            ? ($atts.length ? 'Describe the change to make...' : 'Describe the image to generate...')
+            : ($atts.length ? 'Ask about the attached image...' : 'Send a message, or describe an image...')"
+          data-on:keydown="evt.key === 'Enter' &amp;&amp; !evt.shiftKey &amp;&amp; (evt.preventDefault(), $_send.click())"></textarea>
+
+        <!-- One request, one indicator. Enter presses this button rather than
+             posting on its own, so `sending` covers both ways of sending. -->
+        <button id="send" data-ref:_send data-indicator:sending
+                data-show="!$sending" data-on:click="@post('/ui/send')">Send</button>
+        <button id="stop" data-show="$sending" data-on:click="@post('/ui/cancel')">Stop</button>
       </div>
-      <div id="strengthrow" hidden>
+
+      <div id="strengthrow" data-show="$imgmode &amp;&amp; $atts.length > 0">
         <label for="strength">Keep to the original</label>
-        <input type="range" id="strength" min="0.1" max="0.95" step="0.05" value="0.6">
-        <span id="strengthval">0.60</span>
+        <input type="range" id="strength" min="0.1" max="0.95" step="0.05" data-bind:strength>
+        <span data-text="Number($strength).toFixed(2)"></span>
       </div>
+
       <div id="toolbar">
-        <label><input type="checkbox" id="imgmode"> Image mode</label>
-        <label><input type="checkbox" id="thinkmode"> Reasoning</label>
-        <label id="weblabel" hidden><input type="checkbox" id="webmode"> Web</label>
+        <label><input type="checkbox" data-bind:imgmode> Image mode</label>
+        <label><input type="checkbox" data-bind:think> Reasoning</label>
+        <!-- Shown only when a provider is configured. The status poll patches
+             the two signals; the element itself is never morphed, so the box
+             keeps whatever the user set. -->
+        <label data-show="$searchOn" data-attr:title="$searchTip">
+          <input type="checkbox" data-bind:web> Web</label>
         <span class="hint">Enter to send &middot; drop, paste or attach an image</span>
       </div>
-      <input type="file" id="file-input" accept="image/*" multiple hidden>
+
+      <!-- data-bind base64-encodes the picked files into `files`. That is
+           asynchronous, so the upload is triggered by the signal changing
+           rather than by the change event, which would fire too early.
+           Clearing the input afterwards is what lets the same file be picked
+           twice in a row: an unchanged value fires no change event. -->
+      <input type="file" id="file-input" accept="image/*" multiple hidden
+             data-ref:_file data-bind:files
+             data-effect="$files.length > 0 &amp;&amp; (@post('/ui/attachments'), el.value = '')">
     </div>
   </div>
 </main>
 
 <script>
-const $ = (id) => document.getElementById(id);
-// `attachments` holds what is queued in the composer. Each entry is either a
-// freshly read file ({src}) or a reference to an image the server already has
-// ({ref}), which is how "use as base" avoids re-uploading.
-const state = { thread: null, threads: [], busy: false, abort: null, attachments: [] };
+// What is left after Datastar: two things the browser exposes no declarative
+// hook for, and one piece of scroll etiquette.
 
-// ---------------- markdown (small, deliberate subset) ----------------
-function esc(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// 1. Files from a drop or a paste. Datastar understands <input type=file>, so
+//    hand it the files and let data-bind do the encoding.
+const fileInput = document.getElementById("file-input");
+function accept(files) {
+  const dt = new DataTransfer();
+  for (const f of files || []) if (f.type.startsWith("image/")) dt.items.add(f);
+  if (!dt.files.length) return false;
+  fileInput.files = dt.files;
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
 }
 
-// Fenced code is pulled out before anything else so its contents are never
-// touched by the inline rules, then spliced back at the end.
-function md(src) {
-  const blocks = [];
-  // Pull fenced code out before anything else touches it. The placeholder must
-  // be something prose will never contain.
-  let s = String(src).replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    blocks.push("<pre><code>" + esc(code.replace(/\n$/, "")) + "</code></pre>");
-    return "@@HEARTHCODE" + (blocks.length - 1) + "@@";
-  });
-  s = esc(s);
-  s = s.replace(/`([^`\n]+)`/g, (_, c) => "<code>" + c + "</code>");
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  s = s.replace(/^###\s+(.*)$/gm, "<h3>$1</h3>")
-       .replace(/^##\s+(.*)$/gm, "<h2>$1</h2>")
-       .replace(/^#\s+(.*)$/gm, "<h2>$1</h2>");
-  s = s.replace(/^\s*[-*]\s+(.*)$/gm, "<li>$1</li>");
-  s = s.replace(/^\s*\d+\.\s+(.*)$/gm, "<li>$1</li>");
-  s = s.replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, "<ul>$1</ul>");
-  s = s.split(/\n{2,}/).map((p) =>
-    /^\s*<(h\d|ul|pre|li|blockquote)/.test(p) ? p : "<p>" + p.replace(/\n/g, "<br>") + "</p>"
-  ).join("");
-  return s.replace(/@@HEARTHCODE(\d+)@@/g, (whole, i) =>
-    blocks[+i] === undefined ? whole : blocks[+i]);
-}
-
-// Source URLs reach here from a search provider and from stored history. The
-// markdown renderer already refuses to linkify anything but http(s); an <a>
-// built by hand needs the same rule.
-function safeHref(url) {
-  return /^https?:\/\//i.test(url || "") ? url : "#";
-}
-
-// ---------------- rendering ----------------
-function el(tag, cls, html) {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (html !== undefined) n.innerHTML = html;
-  return n;
-}
-
-// An attachment reference is a stored filename, or already a URL when we are
-// optimistically rendering a message the server has not stored yet.
-function attSrc(name) {
-  return /^(data:|https?:|\/)/.test(name) ? name : "/api/images/" + name;
-}
-
-function imageStats(m) {
-  const bits = ["seed " + m.seed, m.steps + " steps",
-                m.width + "x" + m.height, m.elapsed_s + "s"];
-  if (m.from_image) bits.unshift("from " + m.from_image + " @ " + m.image_strength);
-  return bits.join(" &middot; ");
-}
-
-// Queue a generated image as the base for the next one, without re-uploading it.
-function useAsBase(name) {
-  const wrap = el("div", "imgactions");
-  const b = el("button", null, "Use as base");
-  b.title = "Generate a variation of this image";
-  b.onclick = () => {
-    state.attachments = [{ ref: name, url: "/api/images/" + name }];
-    $("imgmode").checked = true;
-    syncComposer();
-    $("input").focus();
-  };
-  wrap.appendChild(b);
-  return wrap;
-}
-
-// A retrieval is a note about the conversation rather than a turn in it, so it
-// gets one dim line instead of a speaker label and a rendered markdown block.
-function renderToolMessage(m) {
-  const node = el("div", "msg tool");
-  const body = el("div", "body");
-  body.appendChild(el("div", null, esc(m.content)));
-  node.appendChild(body);
-  return node;
-}
-
-function sourceList(sources) {
-  const d = el("details", "sources");
-  d.appendChild(el("summary", null,
-    sources.length + (sources.length === 1 ? " source" : " sources")));
-  const ol = el("ol");
-  for (const s of sources) {
-    const li = el("li");
-    const a = el("a", null, esc(s.title || s.url));
-    a.href = safeHref(s.url);
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    li.appendChild(a);
-    li.appendChild(el("span", "src-url", esc(s.url)));
-    ol.appendChild(li);
-  }
-  d.appendChild(ol);
-  return d;
-}
-
-function renderMessage(m) {
-  if (m.role === "tool") return renderToolMessage(m);
-  const node = el("div", "msg " + m.role);
-  node.appendChild(el("div", "role", m.role === "user" ? "you" : "model"));
-  const body = el("div", "body");
-  const meta = m.meta || {};
-  if (meta.sources && meta.sources.length) {
-    body.appendChild(sourceList(meta.sources));
-  }
-  if (meta.thinking) {
-    const d = el("details", "think");
-    d.appendChild(el("summary", null, "reasoning"));
-    d.appendChild(el("div", "think-body", esc(meta.thinking)));
-    body.appendChild(d);
-  }
-  const atts = meta.images || [];
-  if (atts.length) {
-    const row = el("div", "atts");
-    for (const name of atts) {
-      const t = el("img");
-      t.src = attSrc(name);
-      t.alt = "attached image";
-      row.appendChild(t);
-    }
-    body.appendChild(row);
-  }
-  if (m.image) {
-    const img = el("img", "gen");
-    img.src = "/api/images/" + m.image;
-    img.alt = meta.prompt || "generated image";
-    body.appendChild(img);
-    if (meta.seed !== undefined) {
-      body.appendChild(el("div", "stats", imageStats(meta)));
-    }
-    body.appendChild(useAsBase(m.image));
-  }
-  if (m.content) {
-    body.appendChild(el("div", null,
-      m.role === "user" ? esc(m.content).replace(/\n/g, "<br>") : md(m.content)));
-  }
-  if (meta.tokens_per_second) {
-    body.appendChild(el("div", "stats",
-      meta.tokens_per_second + " tok/s &middot; " + meta.generation_tokens +
-      " tokens &middot; " + meta.elapsed_s + "s"));
-  }
-  node.appendChild(body);
-  return node;
-}
-
-function scrollDown(force) {
-  const box = $("messages");
-  const near = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
-  if (force || near) box.scrollTop = box.scrollHeight;
-}
-
-function showEmpty() {
-  $("mlist").innerHTML =
-    '<div class="empty"><h1>hearth</h1>' +
-    '<p>Ask anything, or tick <b>Image mode</b> to draw.<br>' +
-    'You can also type <code>/image a red barn at dusk</code>.</p></div>';
-}
-
-// ---------------- api ----------------
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (!r.ok) throw new Error((await r.text()) || r.statusText);
-  return r.json();
-}
-
-async function loadThreads() {
-  const data = await api("/api/threads");
-  state.threads = data.threads;
-  drawThreads($("search").value);
-}
-
-function drawThreads(filter) {
-  const box = $("threads");
-  box.innerHTML = "";
-  let list = state.threads;
-  if (filter) {
-    const q = filter.toLowerCase();
-    list = list.filter((t) => t.title.toLowerCase().includes(q));
-  }
-  for (const t of list) {
-    const row = el("div", "thread" + (state.thread === t.id ? " active" : ""));
-    row.appendChild(el("span", "title", esc(t.title)));
-    const del = el("button", "del", "&times;");
-    del.title = "Delete";
-    del.onclick = async (e) => {
-      e.stopPropagation();
-      if (!confirm('Delete "' + t.title + '"?')) return;
-      await fetch("/api/threads/" + t.id, { method: "DELETE" });
-      if (state.thread === t.id) { state.thread = null; showEmpty(); }
-      loadThreads();
-    };
-    row.appendChild(del);
-    row.onclick = () => openThread(t.id);
-    box.appendChild(row);
-  }
-}
-
-async function openThread(id) {
-  state.thread = id;
-  const data = await api("/api/threads/" + id);
-  const list = $("mlist");
-  list.innerHTML = "";
-  for (const m of data.messages) list.appendChild(renderMessage(m));
-  drawThreads($("search").value);
-  scrollDown(true);
-}
-
-async function ensureThread() {
-  if (state.thread) return state.thread;
-  const t = await api("/api/threads", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title: "New conversation" }),
-  });
-  state.thread = t.id;
-  $("mlist").innerHTML = "";
-  await loadThreads();
-  return t.id;
-}
-
-// ---------------- composer attachments ----------------
-function syncComposer() {
-  const box = $("attachments");
-  box.innerHTML = "";
-  for (const [i, att] of state.attachments.entries()) {
-    const t = el("div", "thumb");
-    const img = el("img");
-    img.src = att.url;
-    img.alt = "attachment";
-    t.appendChild(img);
-    const x = el("button", "x", "&times;");
-    x.title = "Remove";
-    x.onclick = () => { state.attachments.splice(i, 1); syncComposer(); };
-    t.appendChild(x);
-    box.appendChild(t);
-  }
-  // The strength control only means anything when generating *from* an image.
-  const editing = $("imgmode").checked && state.attachments.length > 0;
-  $("strengthrow").hidden = !editing;
-  $("input").placeholder = editing
-    ? "Describe the change to make..."
-    : $("imgmode").checked
-      ? "Describe the image to generate..."
-      : state.attachments.length
-        ? "Ask about the attached image..."
-        : "Send a message, or describe an image...";
-}
-
-function addFiles(files) {
-  for (const file of files) {
-    if (!file.type.startsWith("image/")) continue;
-    const reader = new FileReader();
-    reader.onload = () => {
-      state.attachments.push({ src: reader.result, url: reader.result });
-      syncComposer();
-    };
-    reader.readAsDataURL(file);
-  }
-}
-
-// ---------------- streaming ----------------
-async function streamSSE(url, body, onEvent) {
-  state.abort = new AbortController();
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: state.abort.signal,
-  });
-  if (!resp.ok) throw new Error(await resp.text());
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split("\n\n");
-    buf = parts.pop();
-    for (const part of parts) {
-      const line = part.trim();
-      if (!line.startsWith("data: ")) continue;
-      const payload = line.slice(6);
-      if (payload === "[DONE]") return;
-      onEvent(JSON.parse(payload));
-    }
-  }
-}
-
-function setBusy(on) {
-  state.busy = on;
-  $("send").textContent = on ? "Stop" : "Send";
-  $("send").classList.toggle("stop", on);
-}
-
-async function send() {
-  // While generating, the same button acts as Stop.
-  if (state.busy) {
-    await fetch("/api/cancel", { method: "POST" });
-    if (state.abort) state.abort.abort();
-    setBusy(false);
-    return;
-  }
-
-  const text = $("input").value.trim();
-  const atts = state.attachments.slice();
-  if (!text && !atts.length) return;
-  const imageMode = $("imgmode").checked;
-  const think = $("thinkmode").checked;
-  const editing = imageMode && atts.length > 0;
-
-  const id = await ensureThread();
-  $("input").value = "";
-  $("input").style.height = "auto";
-  state.attachments = [];
-  syncComposer();
-
-  const list = $("mlist");
-  if (list.querySelector(".empty")) list.innerHTML = "";
-  list.appendChild(renderMessage({
-    role: "user",
-    content: imageMode ? (editing ? "/edit " : "/image ") + text : text,
-    meta: { images: atts.map((a) => a.url) },
-  }));
-  scrollDown(true);
-
-  // Placeholder bubble that fills in as events arrive.
-  const node = el("div", "msg assistant");
-  node.appendChild(el("div", "role", "model"));
-  const body = el("div", "body");
-  node.appendChild(body);
-  list.appendChild(node);
-  const notice = el("div", "notice", imageMode ? "starting..." : "...");
-  body.appendChild(notice);
-  scrollDown(true);
-
-  setBusy(true);
-  let contentEl = null, thinkEl = null, thinkBody = null;
-  let content = "";
-
-  const onEvent = (ev) => {
-    if (ev.type === "queued") { notice.textContent = "waiting for the model..."; return; }
-    if (ev.type === "status") { notice.textContent = ev.text + "..."; return; }
-
-    if (ev.type === "search") {
-      if (ev.phase === "querying") {
-        notice.textContent = "searching the web for \u201c" + ev.query + "\u201d...";
-      } else if (ev.phase === "fetching") {
-        notice.textContent = "reading " + (ev.urls || []).length + " page(s)...";
-      } else if (ev.phase === "ready") {
-        // The strip goes in as soon as the sources are known, so it is on
-        // screen while the answer that cites it is still being written.
-        if (ev.sources && ev.sources.length) {
-          body.insertBefore(sourceList(ev.sources), body.firstChild);
-        }
-        notice.textContent = "thinking...";
-      } else if (ev.phase === "error") {
-        body.appendChild(el("div", "err", "web search unavailable: " + esc(ev.error)));
-      }
-      return;
-    }
-
-    if (ev.type === "progress") {
-      notice.textContent = "generating - step " + ev.step + "/" + ev.total;
-      let bar = body.querySelector("progress");
-      if (!bar) { bar = el("progress"); bar.max = ev.total; body.appendChild(bar); }
-      bar.value = ev.step;
-      return;
-    }
-
-    if (ev.type === "token") {
-      notice.remove();
-      if (ev.channel === "thinking") {
-        if (!thinkEl) {
-          thinkEl = el("details", "think");
-          thinkEl.open = true;
-          thinkEl.appendChild(el("summary", null, "reasoning"));
-          thinkBody = el("div", "think-body");
-          thinkEl.appendChild(thinkBody);
-          body.insertBefore(thinkEl, body.firstChild);
-        }
-        thinkBody.textContent += ev.text;
-      } else {
-        if (!contentEl) { contentEl = el("div"); body.appendChild(contentEl); }
-        content += ev.text;
-        contentEl.innerHTML = md(content);
-      }
-      scrollDown(false);
-      return;
-    }
-
-    if (ev.type === "done") {
-      notice.remove();
-      const bar = body.querySelector("progress");
-      if (bar) bar.remove();
-      if (thinkEl) thinkEl.open = false;
-      if (ev.image) {
-        const img = el("img", "gen");
-        img.src = ev.url;
-        body.appendChild(img);
-      }
-      const m = ev.meta || {};
-      if (m.tokens_per_second) {
-        body.appendChild(el("div", "stats",
-          m.tokens_per_second + " tok/s &middot; " + m.generation_tokens +
-          " tokens &middot; " + m.elapsed_s + "s"));
-      } else if (m.seed !== undefined) {
-        body.appendChild(el("div", "stats", imageStats(m)));
-      }
-      if (ev.image) body.appendChild(useAsBase(ev.image));
-      loadThreads();
-      scrollDown(false);
-      return;
-    }
-
-    if (ev.type === "cancelled") { notice.textContent = "cancelled"; return; }
-
-    if (ev.type === "error") {
-      notice.remove();
-      body.appendChild(el("div", "err", esc(ev.error)));
-    }
-  };
-
-  try {
-    if (imageMode) {
-      const body = { prompt: text, thread_id: id };
-      if (editing) {
-        // A queued attachment is either bytes we just read or a name the
-        // server already has; both are valid init_image references.
-        body.init_image = atts[0].ref || atts[0].src;
-        body.image_strength = parseFloat($("strength").value);
-      }
-      await streamSSE("/api/images", body, onEvent);
-    } else {
-      const body = { content: text, thinking: think };
-      // Only sent when ticked. Leaving it out means "whatever the server's
-      // policy is", which is what an unticked box should mean - sending false
-      // would override a server configured to decide for itself.
-      if ($("webmode").checked) body.search = true;
-      if (atts.length) body.images = atts.map((a) => a.ref || a.src);
-      await streamSSE("/api/threads/" + id + "/messages", body, onEvent);
-    }
-  } catch (e) {
-    if (e.name !== "AbortError") {
-      notice.remove();
-      body.appendChild(el("div", "err", esc(e.message || e)));
-    }
-  } finally {
-    setBusy(false);
-    $("input").focus();
-  }
-}
-
-// ---------------- status poll ----------------
-async function poll() {
-  try {
-    const s = await api("/api/status");
-    $("dot").classList.add("on");
-    if (s.search) {
-      $("weblabel").hidden = !s.search.enabled;
-      $("weblabel").title = s.search.enabled
-        ? "Search the web before answering (" + s.search.provider + ")"
-        : s.search.reason;
-    }
-    const loaded = ["text", "image"].filter((k) => s[k].loaded);
-    $("sysinfo").textContent =
-      (loaded.length ? loaded.join(" + ") + " loaded - " + s.memory.active_gb + " GB"
-                     : "models idle") +
-      (s.busy_with ? " - " + s.busy_with + " running" : "");
-  } catch (e) {
-    $("dot").classList.remove("on");
-    $("sysinfo").textContent = "server unreachable";
-  }
-}
-
-// ---------------- wiring ----------------
-$("send").onclick = send;
-$("new-btn").onclick = () => {
-  state.thread = null;
-  state.attachments = [];
-  syncComposer();
-  showEmpty();
-  drawThreads($("search").value);
-  $("input").focus();
-};
-$("search").oninput = (e) => drawThreads(e.target.value);
-$("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-});
-$("input").addEventListener("input", (e) => {
-  e.target.style.height = "auto";
-  e.target.style.height = Math.min(e.target.scrollHeight, 200) + "px";
-});
-$("imgmode").addEventListener("change", syncComposer);
-
-// ---------------- attaching images ----------------
-$("attach-btn").onclick = () => $("file-input").click();
-$("file-input").addEventListener("change", (e) => {
-  addFiles(e.target.files);
-  e.target.value = "";   // so picking the same file twice still fires
+const input = document.getElementById("input");
+input.addEventListener("paste", (e) => {
+  if (accept(e.clipboardData?.files)) e.preventDefault();
 });
 
-$("strength").addEventListener("input", (e) => {
-  $("strengthval").textContent = parseFloat(e.target.value).toFixed(2);
-});
-
-// Paste an image straight into the composer.
-$("input").addEventListener("paste", (e) => {
-  const files = [...(e.clipboardData?.files || [])];
-  if (files.length) { e.preventDefault(); addFiles(files); }
-});
-
-// Drag and drop anywhere over the page.
 let dragDepth = 0;
-window.addEventListener("dragenter", (e) => {
+addEventListener("dragenter", (e) => {
   if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
   e.preventDefault();
   dragDepth++;
   document.body.classList.add("dragging");
 });
-window.addEventListener("dragover", (e) => {
+addEventListener("dragover", (e) => {
   if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault();
 });
-window.addEventListener("dragleave", () => {
+addEventListener("dragleave", () => {
   if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
 });
-window.addEventListener("drop", (e) => {
+addEventListener("drop", (e) => {
   if (!e.dataTransfer?.files?.length) return;
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove("dragging");
-  addFiles(e.dataTransfer.files);
+  accept(e.dataTransfer.files);
 });
 
-showEmpty();
-syncComposer();
-loadThreads();
-poll();
-setInterval(poll, 4000);
-$("input").focus();
+// 2. A textarea that grows with its content.
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 200) + "px";
+});
+
+// 3. Follow a stream to the bottom, but only while the reader is already
+//    there. Scrolling up to re-read something must not be undone by the next
+//    token, so pinning is decided by where the reader left the scrollbar.
+const box = document.getElementById("messages");
+let pinned = true;
+box.addEventListener("scroll", () => {
+  pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
+});
+new MutationObserver(() => { if (pinned) box.scrollTop = box.scrollHeight; })
+  .observe(box, { childList: true, subtree: true, characterData: true });
+
+input.focus();
 </script>
 </body>
 </html>

@@ -7,7 +7,6 @@ dist/
 build/
 # generated locally, never checked in
 *.png
-tests/web/md.js
 
 # Beads / Dolt files (added by bd init)
 .dolt/
