@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from hearth.commands import WEB_COMMANDS
 from hearth.mdrender import attr, escape, safe_href
 from hearth.mdrender import render as markdown
 from hearth.store import Message, Thread
@@ -116,6 +117,28 @@ def attachments(names: Iterable[str]) -> str:
             "</div>"
         )
     return f'<div id="attachments">{"".join(thumbs)}</div>'
+
+
+def slash_menu() -> str:
+    """The command list that drops out of the composer when you type "/".
+
+    Datastar has no client-side templating on purpose, so the rows are real
+    elements rendered here, each carrying its own `data-show` for whether it
+    still matches what has been typed. `$_slashMatch` does the matching once,
+    on the page, and every row just asks whether it is in the result.
+    """
+    rows = []
+    for command in WEB_COMMANDS:
+        pick = f"$draft = {_js(command.name + ' ')}; $_input.focus()"
+        rows.append(
+            f'<div class="slash-row"'
+            f' data-show="$_slashMatch.includes({_js(command.name)})"'
+            f' data-on:click="{attr(pick)}">'
+            f'<code>{escape(command.usage)}</code>'
+            f'<span>{escape(command.help)}</span>'
+            "</div>"
+        )
+    return f'<div id="slash" data-show="$_slashMatch.length > 0">{"".join(rows)}</div>'
 
 
 # ---------------- messages ----------------

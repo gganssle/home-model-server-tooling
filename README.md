@@ -520,6 +520,7 @@ src/hearth/
   server.py       FastAPI: thread API, SSE, OpenAI shim
   client.py       HTTP client used by the CLI
   cli.py          commands and the interactive REPL
+  commands.py     the slash commands, shared by both frontends
   search/         web search: providers, fetching, budgeting
   datastar.py     the two SSE frame types the browser understands
   mdrender.py     Markdown -> HTML, a small deliberate subset
@@ -566,6 +567,14 @@ by the *stored* message, which is byte-for-byte what a page reload would
 render, so there is never a live version and a saved version to keep in step.
 A turn that searched re-renders the whole transcript instead, because
 retrieval inserts a `tool` message between the question and the answer.
+
+Typing `/` in the composer drops down the commands the browser understands -
+`/image`, `/edit`, `/think` and `/web`. Datastar has no client-side templating
+by design, so those rows are real elements the server rendered, each carrying
+its own `data-show` for whether it still matches what has been typed; matching
+happens on the page, so it costs no round trip per keystroke. The list itself
+comes from `commands.py`, which the REPL reads too, so the two menus cannot
+drift.
 
 The runtime is served from `/datastar.js` rather than a CDN, so the UI still
 works with the network off.

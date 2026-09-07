@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import iterate_in_threadpool
 
 from hearth import render
+from hearth.commands import OFF_WORDS, ON_WORDS, WEB_COMMANDS
 from hearth.datastar import patch_elements, patch_signals, read_signals
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -151,6 +152,19 @@ def register(app: FastAPI, backend: Backend) -> None:
     def ui_threads(request: Request) -> str:
         sig = read_signals(request.query_params.get("datastar"))
         return _threads_html(str(sig.get("thread") or ""), str(sig.get("search") or ""))
+
+    @app.get("/ui/commands")
+    def ui_commands() -> StreamingResponse:
+        """The composer's command menu, and the names it matches against.
+
+        Sent once on load. The names go into a signal so the page can do its
+        own prefix matching without a round trip per keystroke; the underscore
+        keeps that list out of every subsequent request body.
+        """
+        return _stream([
+            patch_signals({"_slash": [c.name for c in WEB_COMMANDS]}),
+            patch_elements(render.slash_menu()),
+        ])
 
     @app.get("/ui/status")
     def ui_status() -> StreamingResponse:
@@ -352,12 +366,53 @@ def register(app: FastAPI, backend: Backend) -> None:
 
         yield patch_elements(_threads_html(thread.id, search))
 
+    def _mode_command(text: str, sig: Signals) -> Response | None:
+        """Handle `/think` and `/web on|off`, which set a mode rather than say
+        something.
+
+        These live here rather than in `prepare_turn` because they are the web
+        UI's own state - the same two signals the checkboxes drive. The REPL
+        keeps its own copy for the same reason: there is nothing to send.
+
+        A bare verb toggles, matching the REPL. `/web <query>` is not a mode
+        and falls through to the model.
+        """
+        verb, _, rest = text.partition(" ")
+        verb, word = verb.lower(), rest.strip().lower()
+        if verb not in ("/think", "/web") or (word and word not in ON_WORDS + OFF_WORDS):
+            return None
+
+        signal = "think" if verb == "/think" else "web"
+        current = sig.think if verb == "/think" else sig.web
+        value = not current if not word else word in ON_WORDS
+
+        # Turning search on when the server has no provider would flip a
+        # control the page keeps hidden, which is worse than saying so.
+        if signal == "web" and value and not websearch.enabled:
+            return _stream([
+                patch_signals({"draft": ""}),
+                _error_bubble(websearch.unavailable_reason),
+            ])
+        return _stream([patch_signals({signal: value, "draft": ""})])
+
+    def _error_bubble(message: str) -> str:
+        return patch_elements(
+            f'<div class="msg assistant"><div class="body">'
+            f'<div class="err">{render.escape(message)}</div></div></div>',
+            selector="#mlist",
+            mode="append",
+        )
+
     @app.post("/ui/send")
     def ui_send(sig: Signals) -> Response:
         text = sig.draft.strip()
         atts = _known(sig.atts)
         if not text and not atts:
             return Response(status_code=204)
+
+        mode = _mode_command(text, sig)
+        if mode is not None:
+            return mode
 
         thread = backend.resolve(sig.thread) if sig.thread else None
         if thread is None:
@@ -389,14 +444,6 @@ def register(app: FastAPI, backend: Backend) -> None:
             )
         except HTTPException as exc:
             # A rejected turn is a message to the user, not a broken page.
-            return _stream([
-                patch_elements(
-                    f'<div class="msg assistant" id="gen-error">'
-                    f'<div class="body"><div class="err">{render.escape(exc.detail)}</div>'
-                    "</div></div>",
-                    selector="#mlist",
-                    mode="append",
-                )
-            ])
+            return _stream([_error_bubble(str(exc.detail))])
 
         return _stream(_turn_frames(thread, turn, sig.search))

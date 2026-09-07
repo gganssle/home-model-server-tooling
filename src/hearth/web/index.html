@@ -24,7 +24,10 @@
     searchOn  whether a search provider is configured (from /ui/status)
     searchTip why, when it is not
     sending   true while a generation request is open (from data-indicator)
+    _slash    the command names the composer menu offers
+    _slashMatch  those of them still matching what has been typed
     _send     a reference to the send button, so Enter can press it
+    _input    a reference to the composer, so a picked command can focus it
 -->
 <script type="module" src="/datastar.js"></script>
 <style>
@@ -143,6 +146,15 @@
     font-weight: 600; padding: 8px 16px; border-radius: 8px; cursor: pointer; }
   #send { background: var(--accent); }
   #stop { background: var(--danger); color: #fff; }
+  /* ---------- slash menu ---------- */
+  #slash { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-alt);
+    overflow: hidden; }
+  .slash-row { display: flex; gap: 12px; align-items: baseline; padding: 6px 12px;
+    cursor: pointer; font-size: 13px; }
+  .slash-row:hover { background: var(--bg-inset); }
+  .slash-row code { background: none; padding: 0; color: var(--accent);
+    font-size: 12.5px; min-width: 172px; }
+  .slash-row span { color: var(--fg-dim); }
   #toolbar { display: flex; gap: 14px; align-items: center; font-size: 12.5px; color: var(--fg-dim); }
   #toolbar label { display: flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
   .hint { margin-left: auto; color: var(--fg-faint); }
@@ -174,7 +186,7 @@
 </style>
 </head>
 
-<body data-signals="{thread: '', draft: '', search: '', imgmode: false, think: false, web: false, searchOn: false, searchTip: '', strength: 0.6, atts: [], files: []}">
+<body data-signals="{thread: '', draft: '', search: '', imgmode: false, think: false, web: false, searchOn: false, searchTip: '', strength: 0.6, atts: [], files: [], _slash: []}">
 
 <aside id="sidebar">
   <div id="brand"><span class="dot" id="dot"></span> hearth</div>
@@ -200,8 +212,14 @@
   <div id="messages"><div id="mlist"></div></div>
 
   <div id="composer">
-    <div class="wrap">
+    <div class="wrap"
+      data-computed:_slashMatch="$draft.startsWith('/') &amp;&amp; !$draft.includes(' ')
+        ? $_slash.filter((c) =&gt; c.startsWith($draft.toLowerCase())) : []">
       <div id="attachments"></div>
+
+      <!-- The menu is fetched once; the matching is done here so typing does
+           not cost a round trip. Empty until then, which hides it. -->
+      <div id="slash" data-init="@get('/ui/commands', {filterSignals: {exclude: /./}})"></div>
 
       <div id="inputrow">
         <button id="attach-btn" title="Attach an image" data-on:click="$_file.click()">&#128206;</button>
@@ -211,7 +229,10 @@
           data-attr:placeholder="$imgmode
             ? ($atts.length ? 'Describe the change to make...' : 'Describe the image to generate...')
             : ($atts.length ? 'Ask about the attached image...' : 'Send a message, or describe an image...')"
-          data-on:keydown="evt.key === 'Enter' &amp;&amp; !evt.shiftKey &amp;&amp; (evt.preventDefault(), $_send.click())"></textarea>
+          data-ref:_input
+          data-on:keydown="evt.key === 'Tab' &amp;&amp; $_slashMatch.length === 1
+              ? (evt.preventDefault(), $draft = $_slashMatch[0] + ' ')
+              : evt.key === 'Enter' &amp;&amp; !evt.shiftKey &amp;&amp; (evt.preventDefault(), $_send.click())"></textarea>
 
         <!-- One request, one indicator. Enter presses this button rather than
              posting on its own, so `sending` covers both ways of sending. -->
@@ -234,7 +255,7 @@
              keeps whatever the user set. -->
         <label data-show="$searchOn" data-attr:title="$searchTip">
           <input type="checkbox" data-bind:web> Web</label>
-        <span class="hint">Enter to send &middot; drop, paste or attach an image</span>
+        <span class="hint">Enter to send &middot; / for commands &middot; drop or paste an image</span>
       </div>
 
       <!-- data-bind base64-encodes the picked files into `files`. That is

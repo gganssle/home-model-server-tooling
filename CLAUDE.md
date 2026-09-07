@@ -95,6 +95,7 @@ src/hearth/
   server.py       FastAPI: thread API, SSE, OpenAI shim
   client.py       HTTP client used by the CLI
   cli.py          commands and the interactive REPL
+  commands.py     the slash commands, shared by both frontends
   search/         web search: providers, fetching, budgeting
   datastar.py     the two SSE frame types the browser understands
   mdrender.py     Markdown -> HTML, a small deliberate subset
@@ -125,6 +126,12 @@ because the page sends its whole signal bag by design.
 accepts filesystem paths on purpose - the CLI attaches by path - but `webui.py`
 drops the directory part of anything the browser names and requires the file to
 already exist.
+
+**The slash commands live in `commands.py`, not in either frontend.** The REPL
+implements all of them; the web UI offers the ones flagged `web=True`. Three of
+those - `/image`, `/edit`, `/web <query>` - are not frontend features at all:
+`prepare_turn` routes on the leading verb, so they work from any client. The
+flag says which ones the browser *offers*, not which it can send.
 
 **Search availability reaches the page as signals, not markup.** The Web
 control wraps a checkbox, and morphing that element on every status poll would

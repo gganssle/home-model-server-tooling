@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple, Optional
+from typing import Any, Iterator, Optional
 
 import typer
 from rich.console import Console
@@ -21,6 +21,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from hearth import config as config_mod
+from hearth.commands import SLASH_COMMANDS
 from hearth.client import HearthClient, ServerUnavailable
 
 app = typer.Typer(
@@ -741,39 +742,6 @@ def main() -> None:
 # One table drives three things that were previously written out separately,
 # and so drifted: the /help listing, `hearth chat --help`, and the menu that
 # opens when you type "/" at the prompt.
-class Slash(NamedTuple):
-    name: str
-    args: str          # how the arguments are shown in help, e.g. "<prompt>"
-    help: str
-    aliases: tuple[str, ...] = ()
-    choices: tuple[str, ...] = ()   # fixed words, completed after the name
-
-    @property
-    def usage(self) -> str:
-        return f"{self.name} {self.args}".strip()
-
-
-SLASH_COMMANDS = [
-    Slash("/new", "[title]", "start a new conversation"),
-    Slash("/threads", "", "list conversations"),
-    Slash("/switch", "<id|prefix|last>", "jump to another conversation", choices=("last",)),
-    Slash("/image", "<prompt>", "generate an image in this conversation"),
-    Slash("/edit", "<prompt>", "redraw the newest image in this conversation"),
-    Slash("/attach", "<path>", "queue an image for the model to look at"),
-    Slash("/detach", "", "drop queued attachments"),
-    Slash("/think", "on|off", "toggle reasoning mode", choices=("on", "off")),
-    Slash("/web", "on|off|<query>", "search the web now, or for every message",
-          choices=("on", "off")),
-    Slash("/retry", "", "re-run your last message"),
-    Slash("/title", "<text>", "rename this conversation"),
-    Slash("/show", "", "reprint the conversation so far"),
-    Slash("/status", "", "what is loaded, memory use"),
-    Slash("/unload", "[all|text|image]", "free memory", choices=("all", "text", "image")),
-    Slash("/help", "", "this list"),
-    Slash("/quit", "", "exit  (/exit, /q and Ctrl-D also work)", aliases=("/exit", "/q")),
-]
-
-
 def _slash_table(indent: str = "  ") -> list[str]:
     """The command list as aligned plain-text lines."""
     width = max(len(c.usage) for c in SLASH_COMMANDS)

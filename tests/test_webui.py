@@ -172,6 +172,38 @@ check("an unknown filename is refused",
           "/ui/attachments", json={"atts": ["nope.png"], "files": []}))))
 
 # --------------------------------------------------------------------------
+print("\nthe command menu")
+menu = frames(client.get("/ui/commands"))
+menu_html, menu_sig = elements(menu), signals(menu)
+check("the menu is addressable", 'id="slash"' in menu_html)
+check("the names go into a signal for matching", '"_slash"' in menu_sig)
+check("the menu offers the four browser commands",
+      all(c in menu_sig for c in ("/image", "/edit", "/think", "/web")), menu_sig)
+check("and nothing the browser cannot do",
+      not any(c in menu_sig for c in ("/quit", "/threads", "/attach", "/retry")), menu_sig)
+check("each row shows its usage", "/web on|off|&lt;query&gt;" in menu_html, menu_html)
+check("each row shows what it does", "search the web now" in menu_html)
+check("a row fills the composer when clicked", "$draft = '/image '" in menu_html)
+check("rows hide themselves when they stop matching",
+      '$_slashMatch.includes(&#39;/edit&#39;)' in menu_html
+      or '$_slashMatch.includes(\'/edit\')' in menu_html, menu_html)
+
+print("\nmode commands")
+mode = frames(client.post("/ui/send", json={"draft": "/think on", "think": False}))
+check("/think on sets the reasoning signal", '"think":true' in signals(mode))
+check("/think on clears the composer", '"draft":""' in signals(mode))
+check("/think on sends nothing to the model", not elements(mode), elements(mode))
+check("/think off unsets it", '"think":false' in signals(
+    frames(client.post("/ui/send", json={"draft": "/think off", "think": True}))))
+check("a bare /think toggles", '"think":true' in signals(
+    frames(client.post("/ui/send", json={"draft": "/think", "think": False}))))
+check("a bare /think toggles the other way", '"think":false' in signals(
+    frames(client.post("/ui/send", json={"draft": "/think", "think": True}))))
+refused = frames(client.post("/ui/send", json={"draft": "/web on", "web": False}))
+check("/web on says so when no provider is configured", 'class="err"' in elements(refused))
+check("and does not flip a hidden control", '"web":true' not in signals(refused))
+
+# --------------------------------------------------------------------------
 print("\nsending a message")
 check("an empty composer sends nothing", client.post("/ui/send", json={}).status_code == 204)
 
@@ -282,6 +314,21 @@ try:
     forced = elements(frames(sclient.post("/ui/send", json={
         "thread": st2, "draft": "hello", "web": True, "search": ""})))
     check("the Web box forces a search", "searching the web for" in forced)
+
+    on = frames(sclient.post("/ui/send", json={"draft": "/web on", "web": False}))
+    check("/web on turns the mode on when a provider exists", '"web":true' in signals(on))
+    check("/web on sends nothing to the model", not elements(on), elements(on))
+    check("/web off turns it back off", '"web":false' in signals(
+        frames(sclient.post("/ui/send", json={"draft": "/web off", "web": True}))))
+
+    # The one that must not be mistaken for a mode word.
+    stq = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
+    query = elements(frames(sclient.post("/ui/send", json={
+        "thread": stq, "draft": "/web what changed in mlx", "search": ""})))
+    check("/web <query> is still a search, not a mode",
+          "searching the web for" in query, query[:400])
+    check("and the query reaches the provider intact",
+          "what changed in mlx" in query, query[:400])
 
     st3 = sclient.post("/api/threads", json={"title": "New conversation"}).json()["id"]
     unforced = elements(frames(sclient.post("/ui/send", json={
