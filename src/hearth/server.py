@@ -15,6 +15,7 @@ import queue
 import shutil
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, NamedTuple
@@ -114,7 +115,10 @@ class ImageRequest(BaseModel):
 
 class OpenAIMessage(BaseModel):
     role: str
-    content: Any
+    content: Any = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class OpenAIChatRequest(BaseModel):
@@ -122,7 +126,11 @@ class OpenAIChatRequest(BaseModel):
     messages: list[OpenAIMessage]
     stream: bool = False
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     temperature: float | None = None
+    top_p: float | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
 
 
 def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
@@ -384,11 +392,46 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
         out: list[dict[str, Any]] = []
         paths: list[str] = []
         for m in messages:
+            converted: dict[str, Any] = {"role": m.role}
+            if m.name is not None:
+                converted["name"] = m.name
+            if m.tool_call_id is not None:
+                converted["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                converted_calls: list[dict[str, Any]] = []
+                for call in m.tool_calls:
+                    converted_call = dict(call)
+                    function = call.get("function")
+                    if isinstance(function, dict):
+                        converted_function = dict(function)
+                        arguments = function.get("arguments", {})
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except ValueError as exc:
+                                raise HTTPException(
+                                    400, "assistant tool-call arguments must be valid JSON"
+                                ) from exc
+                        if not isinstance(arguments, dict):
+                            raise HTTPException(
+                                400, "assistant tool-call arguments must be a JSON object"
+                            )
+                        converted_function["arguments"] = arguments
+                        converted_call["function"] = converted_function
+                    converted_calls.append(converted_call)
+                converted["tool_calls"] = converted_calls
+
             if isinstance(m.content, str):
-                out.append({"role": m.role, "content": m.content})
+                converted["content"] = m.content
+                out.append(converted)
+                continue
+            if m.content is None:
+                converted["content"] = None
+                out.append(converted)
                 continue
             if not isinstance(m.content, list):
-                out.append({"role": m.role, "content": str(m.content)})
+                converted["content"] = str(m.content)
+                out.append(converted)
                 continue
 
             parts: list[dict[str, Any]] = []
@@ -410,8 +453,90 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     paths.append(str(cfg.image_dir / name))
                     parts.append({"type": "image"})
             parts.append({"type": "text", "text": " ".join(t for t in texts if t).strip()})
-            out.append({"role": m.role, "content": parts if len(parts) > 1 else parts[0]["text"]})
+            converted["content"] = parts if len(parts) > 1 else parts[0]["text"]
+            out.append(converted)
         return out, paths
+
+    def _openai_tools(body: OpenAIChatRequest) -> list[dict[str, Any]] | None:
+        """Resolve the subset of offered tools allowed by tool_choice."""
+        tools = body.tools or []
+        if body.tool_choice == "none":
+            return None
+        if body.tool_choice == "required" and not tools:
+            raise HTTPException(400, "tool_choice is required but no tools were provided")
+        if isinstance(body.tool_choice, dict):
+            function = body.tool_choice.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if name:
+                tools = [
+                    tool for tool in tools
+                    if isinstance(tool.get("function"), dict)
+                    and tool["function"].get("name") == name
+                ]
+                if not tools:
+                    raise HTTPException(400, f"unknown tool in tool_choice: {name}")
+        return tools or None
+
+    def _apply_tool_choice(messages: list[dict[str, Any]], choice: Any) -> None:
+        """Tell Qwen when the OpenAI request requires rather than offers a tool."""
+        name = None
+        if isinstance(choice, dict) and isinstance(choice.get("function"), dict):
+            name = choice["function"].get("name")
+        if choice != "required" and not name:
+            return
+        instruction = (
+            f"For the next response, you must call the {name} tool."
+            if name else "For the next response, you must call one of the available tools."
+        )
+        if messages and messages[0].get("role") == "system":
+            content = messages[0].get("content") or ""
+            messages[0]["content"] = f"{content}\n\n{instruction}".strip()
+        else:
+            messages.insert(0, {"role": "system", "content": instruction})
+
+    def _tool_argument_types(
+        name: str, tools: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        for tool in tools or []:
+            function = tool.get("function")
+            if not isinstance(function, dict) or function.get("name") != name:
+                continue
+            parameters = function.get("parameters")
+            if isinstance(parameters, dict) and isinstance(parameters.get("properties"), dict):
+                return parameters["properties"]
+        return {}
+
+    def _openai_tool_calls(
+        calls: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]]:
+        """Translate Qwen's native tool payloads to OpenAI assistant calls."""
+        out: list[dict[str, Any]] = []
+        for call in calls:
+            function = call.get("function") if isinstance(call.get("function"), dict) else call
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, dict):
+                properties = _tool_argument_types(name, tools)
+                arguments = dict(arguments)
+                for key, value in arguments.items():
+                    schema = properties.get(key)
+                    declared = schema.get("type") if isinstance(schema, dict) else None
+                    types = [declared] if isinstance(declared, str) else declared or []
+                    if isinstance(value, str) and types and "string" not in types:
+                        try:
+                            arguments[key] = json.loads(value)
+                        except ValueError:
+                            pass
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, separators=(",", ":"))
+            out.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        return out
 
     def _latest_image(thread_id: str) -> str | None:
         """Newest image in a thread, generated or attached."""
@@ -806,33 +931,62 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
     async def openai_chat(body: OpenAIChatRequest):
         """Enough of the OpenAI shape to point other local tools at this box."""
         messages, oai_images = _openai_messages(body.messages)
+        tools = _openai_tools(body)
+        _apply_tool_choice(messages, body.tool_choice)
+        require_tool = body.tool_choice == "required" or (
+            isinstance(body.tool_choice, dict)
+            and isinstance(body.tool_choice.get("function"), dict)
+            and bool(body.tool_choice["function"].get("name"))
+        )
+        token_limit = (body.max_tokens if body.max_tokens is not None
+                       else body.max_completion_tokens)
         job = manager.submit_text(
             messages=messages, images=oai_images,
-            max_tokens=body.max_tokens, temperature=body.temperature,
+            max_tokens=token_limit,
+            temperature=body.temperature, top_p=body.top_p, tools=tools,
         )
         created = int(time.time())
         cid = f"chatcmpl-{created}"
 
         if not body.stream:
             splitter = ThinkSplitter()
+            calls = ToolCallSplitter(enabled=bool(tools))
             meta: dict[str, Any] = {}
             for event in job.events():
                 if event.get("type") == "start":
                     splitter = ThinkSplitter(start_in_think=event.get("thinking_open", False))
                 elif event.get("type") == "token":
-                    splitter.feed(event["text"])
+                    for channel, piece in splitter.feed(event["text"]):
+                        if channel == "content":
+                            calls.feed(piece)
                 elif event.get("type") == "done":
-                    splitter.finish()
+                    for channel, piece in splitter.finish():
+                        if channel == "content":
+                            calls.feed(piece)
+                    calls.finish()
                     meta = event.get("meta") or {}
                 elif event.get("type") == "error":
                     raise HTTPException(500, event["error"])
+            tool_calls = _openai_tool_calls(calls.calls, tools)
+            if not tool_calls and require_tool:
+                raise HTTPException(500, "model did not call a required tool")
+            message: dict[str, Any] = {
+                "role": "assistant", "content": calls.visible_text.strip() or None,
+            }
+            if tool_calls:
+                message["tool_calls"] = tool_calls
             return {
                 "id": cid, "object": "chat.completion", "created": created,
                 "model": cfg.text.repo,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": splitter.content_text.strip()},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": (
+                        "tool_calls" if tool_calls
+                        else "length" if token_limit is not None
+                        and meta.get("generation_tokens", 0) >= token_limit
+                        else "stop"
+                    ),
                 }],
                 "usage": {
                     "prompt_tokens": meta.get("prompt_tokens", 0),
@@ -843,6 +997,12 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
 
         def gen() -> Iterator[str]:
             splitter = ThinkSplitter()
+            calls = ToolCallSplitter(enabled=bool(tools))
+            yield sse({
+                "id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": cfg.text.repo,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            })
             for event in job.events():
                 if event.get("type") == "start":
                     splitter = ThinkSplitter(start_in_think=event.get("thinking_open", False))
@@ -850,25 +1010,63 @@ def create_app(cfg: config_mod.Config | None = None) -> FastAPI:
                     for channel, piece in splitter.feed(event["text"]):
                         if channel != "content":
                             continue
-                        yield sse({
-                            "id": cid, "object": "chat.completion.chunk", "created": created,
-                            "model": cfg.text.repo,
-                            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
-                        })
-                elif event.get("type") == "done":
-                    for channel, piece in splitter.finish():
-                        if channel == "content":
+                        for visible in calls.feed(piece):
                             yield sse({
                                 "id": cid, "object": "chat.completion.chunk", "created": created,
                                 "model": cfg.text.repo,
-                                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                                "choices": [{"index": 0, "delta": {"content": visible},
+                                             "finish_reason": None}],
                             })
+                elif event.get("type") == "done":
+                    for channel, piece in splitter.finish():
+                        if channel == "content":
+                            for visible in calls.feed(piece):
+                                yield sse({
+                                    "id": cid, "object": "chat.completion.chunk",
+                                    "created": created, "model": cfg.text.repo,
+                                    "choices": [{"index": 0, "delta": {"content": visible},
+                                                 "finish_reason": None}],
+                                })
+                    for piece in calls.finish():
+                        yield sse({
+                            "id": cid, "object": "chat.completion.chunk", "created": created,
+                            "model": cfg.text.repo,
+                            "choices": [{"index": 0, "delta": {"content": piece},
+                                         "finish_reason": None}],
+                        })
+                    tool_calls = _openai_tool_calls(calls.calls, tools)
+                    if not tool_calls and require_tool:
+                        yield sse({"error": {
+                            "message": "model did not call a required tool",
+                            "type": "server_error",
+                        }})
+                        yield "data: [DONE]\n\n"
+                        return
+                    for index, call in enumerate(tool_calls):
+                        yield sse({
+                            "id": cid, "object": "chat.completion.chunk", "created": created,
+                            "model": cfg.text.repo,
+                            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                                "index": index, **call,
+                            }]}, "finish_reason": None}],
+                        })
                     yield sse({
                         "id": cid, "object": "chat.completion.chunk", "created": created,
                         "model": cfg.text.repo,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": (
+                            "tool_calls" if tool_calls
+                            else "length" if token_limit is not None
+                            and (event.get("meta") or {}).get("generation_tokens", 0) >= token_limit
+                            else "stop"
+                        )}],
                     })
                     yield "data: [DONE]\n\n"
+                elif event.get("type") == "error":
+                    yield sse({
+                        "error": {"message": event["error"], "type": "server_error"},
+                    })
+                    yield "data: [DONE]\n\n"
+                    return
 
         return StreamingResponse(iterate_in_threadpool(gen()), media_type="text/event-stream")
 

@@ -151,6 +151,73 @@ check("openai stream shape", streamed == "you said: ping", repr(streamed))
 check("openai stream terminates", "[DONE]" in r.text)
 check("models listed", len(client.get("/v1/models").json()["data"]) == 2)
 
+tool = {"type": "function", "function": {
+    "name": "bash", "description": "Run a shell command", "parameters": {
+        "type": "object", "properties": {
+            "command": {"type": "string"}, "timeout": {"type": "integer"},
+        },
+        "required": ["command"],
+    },
+}}
+request = {
+    "model": "x", "messages": [{"role": "user", "content": "RUN_TOOL"}],
+    "tools": [tool],
+}
+oai = client.post("/v1/chat/completions", json=request).json()
+choice = oai["choices"][0]
+call = choice["message"]["tool_calls"][0]
+check("openai tool call finish reason", choice["finish_reason"] == "tool_calls", str(choice))
+check("openai tool call name", call["function"]["name"] == "bash", str(call))
+check("openai tool arguments are JSON",
+      json.loads(call["function"]["arguments"])["command"] == "pwd", str(call))
+check("tool arguments follow their schema",
+      json.loads(call["function"]["arguments"])["timeout"] == 30, str(call))
+check("native tool syntax is hidden", "tool_call" not in (choice["message"]["content"] or ""),
+      str(choice))
+
+followup = request["messages"] + [
+    choice["message"],
+    {"role": "tool", "tool_call_id": call["id"], "content": "/tmp/project"},
+]
+oai = client.post("/v1/chat/completions", json={
+    "model": "x", "messages": followup, "tools": [tool],
+}).json()
+check("openai tool result completes the loop",
+      oai["choices"][0]["message"]["content"] == "tool returned: /tmp/project", str(oai))
+
+r = client.post("/v1/chat/completions", json={**request, "stream": True})
+chunks = sse_events(r)
+stream_calls = [tc for chunk in chunks for choice in chunk.get("choices", [])
+                for tc in choice.get("delta", {}).get("tool_calls", [])]
+check("openai stream emits tool calls", stream_calls[0]["function"]["name"] == "bash",
+      str(stream_calls))
+check("openai stream tool finish reason",
+      chunks[-1]["choices"][0]["finish_reason"] == "tool_calls", str(chunks[-1]))
+check("tool_choice none suppresses tools",
+      "tool_calls" not in client.post("/v1/chat/completions", json={
+          **request, "tool_choice": "none",
+      }).json()["choices"][0]["message"])
+check("unknown forced tool is rejected",
+      client.post("/v1/chat/completions", json={
+          **request, "tool_choice": {"type": "function", "function": {"name": "missing"}},
+      }).status_code == 400)
+check("missing required call is an error",
+      client.post("/v1/chat/completions", json={
+          "model": "x", "messages": [{"role": "user", "content": "ping"}],
+          "tools": [tool], "tool_choice": "required",
+      }).status_code == 500)
+check("missing named call is an error",
+      client.post("/v1/chat/completions", json={
+          "model": "x", "messages": [{"role": "user", "content": "ping"}],
+          "tools": [tool],
+          "tool_choice": {"type": "function", "function": {"name": "bash"}},
+      }).status_code == 500)
+check("token limit uses the length finish reason",
+      client.post("/v1/chat/completions", json={
+          "model": "x", "messages": [{"role": "user", "content": "ping"}],
+          "max_tokens": 4,
+      }).json()["choices"][0]["finish_reason"] == "length")
+
 print("\nimage input (vision)")
 import base64  # noqa: E402
 from test_integration_stubs import SAMPLE_PNG  # noqa: E402

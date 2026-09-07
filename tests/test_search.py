@@ -394,6 +394,22 @@ check("a nested function shape is understood",
 check("another tool is ignored",
       tool_call_query({"name": "get_weather", "arguments": {"query": "y"}}) is None)
 
+visible, calls = run_splitter([
+    "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n",
+    "<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+])
+check("Qwen3.6 function syntax is captured",
+      calls == [{"name": "bash", "arguments": {"command": "pwd", "timeout": "30"}}],
+      str(calls))
+check("Qwen3.6 function syntax is hidden", visible == "", repr(visible))
+
+_, calls = run_splitter([
+    "<tool_call><function=write><parameter=content>\n123\n</parameter>",
+    "</function></tool_call>",
+])
+check("native string-looking values stay strings",
+      calls[0]["arguments"]["content"] == "123", str(calls))
+
 
 # --------------------------------------------------------------------------
 print("\nsystem prompt")
